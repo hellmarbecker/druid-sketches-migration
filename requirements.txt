@@ -1,0 +1,15 @@
+# Direct dependencies. Install with:  pip install -r requirements.txt
+# Verified to resolve on Python 3.14.6 (datasketches builds a cp314 wheel from source).
+
+# Reads/writes Apache DataSketches HLL and Theta sketches. Must stay binary-compatible
+# with the datasketches-java 4.2.0 that wrote the sketches in Druid.
+datasketches==5.2.0
+
+# ClickHouse client (HTTP).
+clickhouse-connect==1.6.0
+
+# Druid HTTP query APIs.
+requests==2.34.2
+
+# Loads .env (DRUID_HOME, endpoints).
+python-dotenv==1.2.2

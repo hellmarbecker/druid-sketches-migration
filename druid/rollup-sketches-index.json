@@ -1,0 +1,67 @@
+{
+  "type": "index_parallel",
+  "spec": {
+    "ioConfig": {
+      "type": "index_parallel",
+      "inputSource": {
+        "type": "local",
+        "baseDir": "/Users/hellmarbecker/apache-druid-37.0.0/quickstart/tutorial",
+        "filter": "wikiticker-2015-09-12-sampled.json.gz"
+      },
+      "inputFormat": { "type": "json" }
+    },
+    "tuningConfig": {
+      "type": "index_parallel",
+      "partitionsSpec": { "type": "dynamic" },
+      "maxRowsInMemory": 25000
+    },
+    "dataSchema": {
+      "dataSource": "wikipedia_rollup_sketches",
+      "timestampSpec": { "column": "time", "format": "iso" },
+      "granularitySpec": {
+        "type": "uniform",
+        "segmentGranularity": "DAY",
+        "queryGranularity": "HOUR",
+        "rollup": true,
+        "intervals": ["2015-09-12/2015-09-13"]
+      },
+      "dimensionsSpec": {
+        "dimensions": ["channel", "countryName", "isRobot"]
+      },
+      "metricsSpec": [
+        { "type": "count", "name": "count" },
+        { "type": "longSum", "name": "sum_added", "fieldName": "added" },
+
+        {
+          "comment": "Druid defaults: lgK=12, HLL_4. Dense form has a 4-bit register array + exceptions table.",
+          "type": "HLLSketchBuild",
+          "name": "users_hll_k12_hll4",
+          "fieldName": "user",
+          "lgK": 12,
+          "tgtHllType": "HLL_4"
+        },
+        {
+          "comment": "Deliberately non-default so the spike proves it reads lgK/tgtType per column rather than assuming.",
+          "type": "HLLSketchBuild",
+          "name": "pages_hll_k14_hll8",
+          "fieldName": "page",
+          "lgK": 14,
+          "tgtHllType": "HLL_8"
+        },
+
+        {
+          "type": "thetaSketch",
+          "name": "users_theta_16384",
+          "fieldName": "user",
+          "size": 16384
+        },
+        {
+          "type": "thetaSketch",
+          "name": "pages_theta_4096",
+          "fieldName": "page",
+          "size": 4096
+        }
+      ]
+    }
+  }
+}
