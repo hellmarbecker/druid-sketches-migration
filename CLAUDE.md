@@ -196,6 +196,12 @@ cross-row merge, so expect ~1.6% RSE instead of ~0.8%. Building a Theta column i
 - Never assert "+N exactly" against a sketch in estimation mode: each new value moves the
   estimate by ~1/theta. Exactness checks are only valid below k.
 
+## Reference docs
+
+`docs/hll-sketch-formats.md` — both HLL binary formats field by field, a side-by-side comparison,
+and the argument for why transplanted sketches merge with each other but not with native
+ClickHouse ones. Read it before touching `uniqhll12.py` or either HLL migration.
+
 ## ClickHouse `uniqHLL12` state format (reverse-engineered)
 
 Codec in `uniqhll12.py`; evidence and re-validation in `spikes/reverse_uniqhll12.py`. **This
