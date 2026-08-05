@@ -69,6 +69,12 @@ Then any of the migrations (each migrates and self-verifies, ending in `ALL CHEC
 
 Each migration recreates its target table, so all are safe to re-run.
 
+`druid/rollup-sketches-index.sql` is a verified SQL-based (MSQ) translation of the same spec,
+kept for reference; it writes `wikipedia_rollup_sketches_sql` so it cannot clobber the fixture.
+Its header documents the submit recipe and two context settings that matter —
+`finalizeAggregations: false` (else sketch columns land as plain numbers) and
+`maxNumTasks: 2` (exceeding the middleManager's `druid.worker.capacity` deadlocks silently).
+
 `druid/rollup-sketches-index.json` builds `wikipedia_rollup_sketches` from the bundled wikiticker
 sample: HOUR rollup, 3 dimensions, 39,244 events → 2,486 rows (15.8x). It carries **four** sketch
 columns with deliberately different parameters (`lgK` 12/14, `HLL_4`/`HLL_8`, theta `size`
