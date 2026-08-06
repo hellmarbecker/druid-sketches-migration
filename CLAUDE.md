@@ -263,10 +263,13 @@ exceed that, so they must be clamped — a value above 21 would overflow the his
 the state. Probability of a rank above 21 is ~2⁻²¹ per item, so the clamp is statistically
 irrelevant but not optional.
 
-The histogram is not decoration: ClickHouse rebuilds its denominator from it, so it must be
-recomputed from the registers you actually wrote. `encode_state()` derives it rather than
-accepting one. Validation is a byte-exact round-trip of states ClickHouse produced itself,
-at every cardinality from 17 to 1e6.
+**This build ignores the stored histogram on read** — measured with four states holding
+identical registers but different histograms (correct, all-zero, "all empty", "all at max"),
+which all return the same estimate. ClickHouse recomputes the denominator from the registers.
+Still write a correct histogram: `encode_state()` derives it from the registers, because a
+byte-exact round-trip against ClickHouse's own states is the regression gate for the format,
+and the read path ignoring the field is unspecified behaviour rather than a contract.
+Validation is that round-trip, at every cardinality from 17 to 1e6.
 
 ## HLL transplant path (working — `migrate_hll_transplant.py`)
 

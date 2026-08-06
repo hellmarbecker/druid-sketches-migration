@@ -144,10 +144,19 @@ Transplants must always emit the dense form.
 4096 × 5 bits = 2560 bytes exactly, with no padding: the last register ends flush on the byte
 boundary.
 
-The histogram is **not decoration** — ClickHouse rebuilds its denominator from it, so a state
-whose histogram disagrees with its registers yields silently wrong estimates. `encode_state()`
-in `uniqhll12.py` therefore derives it from the registers written rather than accepting one.
-The counters sum to exactly 4096 at every cardinality measured.
+The counters sum to exactly 4096 at every cardinality measured, and `histogram[0]` always equals
+the trailing `UInt16`.
+
+**On read, this build ignores the stored histogram.** Measured directly: four states carrying
+*identical* registers but deliberately different histograms — correct, all-zero, "claims every
+register is empty", and "claims every register is at max rank" — all return the same estimate
+(6130). So ClickHouse recomputes its denominator from the registers rather than trusting what
+was serialised, and a wrong histogram does not corrupt query results here.
+
+Write a correct one anyway, which `encode_state()` does by deriving it from the registers rather
+than accepting one. Two reasons: it is required for byte-exact round-trip with states ClickHouse
+produced itself, which is the regression gate for this whole format; and the read path ignoring
+the field is unspecified behaviour of an internal layout, not a contract to depend on.
 
 ### Hashing and rank derivation
 

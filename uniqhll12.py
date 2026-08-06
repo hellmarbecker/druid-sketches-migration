@@ -67,8 +67,12 @@ def decode_registers(state: bytes) -> list[int]:
 def encode_state(registers: list[int]) -> bytes:
     """Build a dense uniqHLL12 state from 4096 register values.
 
-    The histogram is derived here rather than taken on trust: ClickHouse rebuilds its
-    denominator from it, so an inconsistent histogram yields silently wrong estimates.
+    The histogram is derived from the registers rather than accepted as an argument.
+    ClickHouse 26.8.1.120 turns out to ignore it on read -- it recomputes the denominator
+    from the registers, and states with deliberately wrong histograms still estimate
+    correctly -- but writing a correct one is required for a byte-exact round-trip against
+    states ClickHouse produced itself, which is how this format is regression-tested. Not a
+    field to leave to chance in an internal layout with no stability contract.
     """
     if len(registers) != BUCKETS:
         raise ValueError(f"expected {BUCKETS} registers, got {len(registers)}")

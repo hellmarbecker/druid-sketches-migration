@@ -58,6 +58,53 @@ def test_uniqhll12_small_set_form_is_still_sparse_below_17(ch_query):
 
 
 @pytest.mark.clickhouse
+def test_clickhouse_ignores_the_stored_histogram(ch_query):
+    """Documents observed behaviour, and pins it so a change surfaces here.
+
+    The estimate is computed from the registers; the serialised histogram is recomputed on
+    read rather than trusted. Four states with identical registers but deliberately wrong
+    histograms must therefore agree. We still write a correct histogram -- byte-exact
+    round-trip against ClickHouse's own states depends on it -- but no *estimate* does.
+    """
+    import random
+    from uniqhll12 import BUCKETS, HIST_SLOTS, REG_BYTES
+
+    rng = random.Random(7)
+    regs = [rng.choice([0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]) for _ in range(BUCKETS)]
+    good = encode_state(regs)
+
+    def rewrite_histogram(state, hist, zero_count):
+        b = bytearray(state)
+        b[1 + REG_BYTES: 1 + REG_BYTES + HIST_SLOTS * 4] = struct.pack(f"<{HIST_SLOTS}I", *hist)
+        b[1 + REG_BYTES + HIST_SLOTS * 4:] = struct.pack("<H", zero_count)
+        return bytes(b)
+
+    variants = {
+        "good": good,
+        "zeroed": rewrite_histogram(good, [0] * HIST_SLOTS, 0),
+        "claims_empty": rewrite_histogram(good, [BUCKETS] + [0] * (HIST_SLOTS - 1), BUCKETS),
+        "claims_full": rewrite_histogram(good, [0] * (HIST_SLOTS - 1) + [BUCKETS], 0),
+    }
+    for state in variants.values():
+        assert decode_registers(state) == regs, "variants must differ only in the histogram"
+
+    ch_query("DROP TABLE IF EXISTS _t_hist")
+    ch_query("CREATE TABLE _t_hist (label String, s AggregateFunction(uniqHLL12, String)) "
+             "ENGINE = MergeTree ORDER BY label")
+    try:
+        for label, state in variants.items():
+            ch_query("INSERT INTO _t_hist FORMAT RowBinary", data=enc_string(label) + state)
+        got = {label: int(ch_query(
+            f"SELECT uniqHLL12Merge(s) FROM _t_hist WHERE label = '{label}'"))
+            for label in variants}
+        assert len(set(got.values())) == 1, (
+            f"the stored histogram now affects the estimate: {got} -- "
+            "docs/hll-sketch-formats.md says it does not, and needs updating")
+    finally:
+        ch_query("DROP TABLE IF EXISTS _t_hist")
+
+
+@pytest.mark.clickhouse
 def test_transplanted_state_is_readable_by_clickhouse(ch_query):
     ch_query("DROP TABLE IF EXISTS _t_transplant")
     ch_query("CREATE TABLE _t_transplant (label String, s AggregateFunction(uniqHLL12, String)) "
