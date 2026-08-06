@@ -27,8 +27,37 @@ python3 -m venv .venv                     # Python 3.14.6 on PATH
 C++ toolchain). Add new direct dependencies to `requirements.txt` with a pinned version and a
 comment saying why; leave transitive deps out.
 
-No test runner or linter is chosen yet, so there is no test/lint command to run. Ask before
+### Tests
+
+**pytest**, configured in `pytest.ini`, tests in `tests/`. No linter is chosen yet — ask before
 picking one.
+
+```bash
+.venv/bin/pytest                      # everything; integration tests self-skip if servers are down
+.venv/bin/pytest -m "not integration" # offline only, ~0.3 s
+.venv/bin/pytest -m clickhouse        # one system's integration tests
+.venv/bin/pytest tests/test_uniqhll12.py -k clamp   # single file / single test
+```
+
+The suite splits along one line: **offline tests need nothing running**, and cover the fragile
+pure logic — the reverse-engineered `uniqhll12.py` codec and the RowBinary encoders in
+`sketch_io.py`. **Integration tests** are marked `druid` / `clickhouse` (plus an umbrella
+`integration`) and *skip themselves* when their server is unreachable, so a bare `pytest` run
+always works. `conftest.py` probes reachability once per session and caches it; the Druid probe
+also requires the fixture datasource to exist, so a bare Druid does not produce failures that
+have nothing to do with the code.
+
+Integration tests own the claims no offline test can reach: that the `uniqHLL12` state format
+still matches this ClickHouse build (byte-exact round-trip of states ClickHouse produced), that
+the DataSketches seed hash still matches across systems, and the two HLL merge behaviours.
+`test_transplanted_and_native_states_must_not_be_mixed` asserts the breakage *stays* broken — if
+it ever starts passing, the hashes have converged and the docs need revisiting.
+
+These do not replace the `verify()` functions in the migration scripts, which check a full
+end-to-end migration against live data. The suite pins the units those scripts are built from.
+
+Tests that touch ClickHouse create and drop their own `_t_*` tables and never write to the
+migration targets.
 
 ### Druid test fixture
 
@@ -89,8 +118,9 @@ reverse-engineered ClickHouse HLL codec). `spikes/` holds the investigations tha
 format findings; `druid/` and `clickhouse/` hold fixture config.
 
 Still undecided (do not assume): whether this ships as a library or a CLI — the scripts are
-currently hard-coded to the fixture datasource. There is no test runner; verification is the
-`verify()` function inside each migration, which needs both servers running.
+currently hard-coded to the fixture datasource. Verification comes in two layers: the pytest
+suite in `tests/` (offline tests run anywhere; integration tests self-skip), and the `verify()`
+function inside each migration, which needs both servers running.
 
 ## Local environment
 

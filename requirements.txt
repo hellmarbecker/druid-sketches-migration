@@ -13,3 +13,6 @@ requests==2.34.2
 
 # Loads .env (DRUID_HOME, endpoints).
 python-dotenv==1.2.2
+
+# Test runner. `pythonpath` in pytest.ini needs pytest >= 7.
+pytest==9.1.1
