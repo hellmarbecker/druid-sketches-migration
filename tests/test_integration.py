@@ -1,0 +1,249 @@
+"""Tests that need a live Druid and/or ClickHouse. They skip themselves when it is not up.
+
+Start them per CLAUDE.md:
+    cd $DRUID_HOME && bin/start-druid -m 6g
+    clickhouse server --config-file=clickhouse/config.xml
+
+These cover the claims the migrations rest on and that no offline test can reach:
+the uniqHLL12 format still matching this ClickHouse build, the DataSketches seed still
+matching across systems, and the two HLL merge behaviours (transplanted states union
+correctly with each other; mixing with native states double-counts).
+"""
+
+from __future__ import annotations
+
+import base64
+import struct
+
+import pytest
+from datasketches import hll_sketch, hll_union, tgt_hll_type, update_theta_sketch
+
+from sketch_io import decode_druid_sketch, enc_agg_state, enc_string
+from uniqhll12 import LG_K, decode_registers, encode_state, state_from_datasketches
+
+FIXTURE = "wikipedia_rollup_sketches"
+EXPECTED_ROWS = 2486
+EXPECTED_EVENTS = 39244
+DS_DEFAULT_SEED_HASH = 37836
+
+
+def hll(items, lg_k=LG_K):
+    s = hll_sketch(lg_k, tgt_hll_type.HLL_8)
+    for i in items:
+        s.update(i)
+    return s
+
+
+# --------------------------------------------------------------------------- ClickHouse
+@pytest.mark.clickhouse
+@pytest.mark.parametrize("n", [17, 100, 1000, 100000])
+def test_uniqhll12_format_still_matches_this_build(ch_query, n):
+    """The regression gate for the reverse-engineered format. If ClickHouse ever changes its
+    aggregate-state layout, this fails and migrate_hll_transplant.py must not be trusted."""
+    produced = bytes.fromhex(
+        ch_query(f"SELECT hex(toString(uniqHLL12State(number))) FROM numbers({n})"))
+    assert encode_state(decode_registers(produced)) == produced
+
+
+@pytest.mark.clickhouse
+def test_uniqhll12_small_set_form_is_still_sparse_below_17(ch_query):
+    """Transplants must always emit the dense form; this pins where the boundary sits."""
+    for n, expected_len in ((1, 10), (16, 130)):
+        state = bytes.fromhex(
+            ch_query(f"SELECT hex(toString(uniqHLL12State(number))) FROM numbers({n})"))
+        assert state[0] == 0 and len(state) == expected_len
+    dense = bytes.fromhex(
+        ch_query("SELECT hex(toString(uniqHLL12State(number))) FROM numbers(17)"))
+    assert dense[0] == 1 and len(dense) == 2651
+
+
+@pytest.mark.clickhouse
+def test_transplanted_state_is_readable_by_clickhouse(ch_query):
+    ch_query("DROP TABLE IF EXISTS _t_transplant")
+    ch_query("CREATE TABLE _t_transplant (label String, s AggregateFunction(uniqHLL12, String)) "
+             "ENGINE = MergeTree ORDER BY label")
+    try:
+        s = hll(f"v{i}" for i in range(10000))
+        ch_query("INSERT INTO _t_transplant FORMAT RowBinary",
+                 data=enc_string("a") + state_from_datasketches(s.serialize_compact()))
+        got = float(ch_query("SELECT uniqHLL12Merge(s) FROM _t_transplant"))
+        # Two different bias corrections over the same registers; a few percent is expected,
+        # a wildly different number means the transplant is broken.
+        assert abs(got - s.get_estimate()) / s.get_estimate() < 0.06
+    finally:
+        ch_query("DROP TABLE IF EXISTS _t_transplant")
+
+
+@pytest.mark.clickhouse
+def test_transplanted_states_union_with_each_other(ch_query):
+    """The property that makes native uniqHLL12Merge usable on migrated data."""
+    ch_query("DROP TABLE IF EXISTS _t_union")
+    ch_query("CREATE TABLE _t_union (label String, s AggregateFunction(uniqHLL12, String)) "
+             "ENGINE = MergeTree ORDER BY label")
+    try:
+        a = hll(f"k{i}" for i in range(1000))
+        b = hll(f"k{i}" for i in range(500, 1500))
+        for label, sk in (("a", a), ("b", b), ("a_dup", a)):
+            ch_query("INSERT INTO _t_union FORMAT RowBinary",
+                     data=enc_string(label) + state_from_datasketches(sk.serialize_compact()))
+
+        ab = int(ch_query("SELECT uniqHLL12Merge(s) FROM _t_union WHERE label IN ('a','b')"))
+        with_dup = int(ch_query("SELECT uniqHLL12Merge(s) FROM _t_union"))
+        assert abs(ab - 1500) / 1500 < 0.05, "union of overlapping sets should approach 1500"
+        assert with_dup == ab, "re-adding an identical sketch must not inflate the union"
+    finally:
+        ch_query("DROP TABLE IF EXISTS _t_union")
+
+
+@pytest.mark.clickhouse
+def test_transplanted_and_native_states_must_not_be_mixed(ch_query):
+    """Documents the hard constraint by demonstrating the breakage. If this ever stops
+    failing, the two systems have converged on a hash and the docs need revisiting."""
+    ch_query("DROP TABLE IF EXISTS _t_mix")
+    ch_query("CREATE TABLE _t_mix (label String, s AggregateFunction(uniqHLL12, String)) "
+             "ENGINE = MergeTree ORDER BY label")
+    try:
+        a = hll(f"k{i}" for i in range(1000))
+        ch_query("INSERT INTO _t_mix FORMAT RowBinary",
+                 data=enc_string("transplanted") + state_from_datasketches(a.serialize_compact()))
+        ch_query("INSERT INTO _t_mix SELECT 'native', "
+                 "uniqHLL12State(concat('k', toString(number))) FROM numbers(1000)")
+
+        transplanted = int(ch_query("SELECT uniqHLL12Merge(s) FROM _t_mix WHERE label='transplanted'"))
+        native = int(ch_query("SELECT uniqHLL12Merge(s) FROM _t_mix WHERE label='native'"))
+        merged = int(ch_query("SELECT uniqHLL12Merge(s) FROM _t_mix"))
+
+        assert abs(transplanted - 1000) / 1000 < 0.05
+        assert abs(native - 1000) / 1000 < 0.05
+        assert merged > 1.8 * 1000, (
+            "identical inputs merged to ~1x, so the hashes now agree -- "
+            "re-check docs/hll-sketch-formats.md before relying on this")
+    finally:
+        ch_query("DROP TABLE IF EXISTS _t_mix")
+
+
+@pytest.mark.clickhouse
+def test_uniqtheta_state_is_a_bare_length_prefixed_sketch(ch_query):
+    """The whole Theta write path is varint(len) + compact sketch, with no wrapper."""
+    ch_query("DROP TABLE IF EXISTS _t_theta")
+    ch_query("CREATE TABLE _t_theta (s AggregateFunction(uniqTheta, String)) "
+             "ENGINE = MergeTree ORDER BY tuple()")
+    try:
+        sk = update_theta_sketch(14)
+        for i in range(1000):
+            sk.update(f"probe{i}")
+        ch_query("INSERT INTO _t_theta FORMAT RowBinary",
+                 data=enc_agg_state(sk.compact().serialize()))
+        assert int(ch_query("SELECT uniqThetaMerge(s) FROM _t_theta")) == 1000
+    finally:
+        ch_query("DROP TABLE IF EXISTS _t_theta")
+
+
+@pytest.mark.clickhouse
+def test_theta_dedupes_across_systems(ch_query):
+    """Unlike HLL, a transcoded Theta sketch unions correctly with a native one."""
+    ch_query("DROP TABLE IF EXISTS _t_theta_mix")
+    ch_query("CREATE TABLE _t_theta_mix (label String, s AggregateFunction(uniqTheta, String)) "
+             "ENGINE = MergeTree ORDER BY label")
+    try:
+        sk = update_theta_sketch(14)
+        for i in range(1000):
+            sk.update(f"probe{i}")
+        ch_query("INSERT INTO _t_theta_mix FORMAT RowBinary",
+                 data=enc_string("transcoded") + enc_agg_state(sk.compact().serialize()))
+        ch_query("INSERT INTO _t_theta_mix SELECT 'native_same', "
+                 "uniqThetaState(concat('probe', toString(number))) FROM numbers(1000)")
+        ch_query("INSERT INTO _t_theta_mix SELECT 'native_shift', "
+                 "uniqThetaState(concat('probe', toString(number + 500))) FROM numbers(1000)")
+
+        # Under k=4096 everything is exact, so these are equalities, not tolerances.
+        same = int(ch_query("SELECT uniqThetaMerge(s) FROM _t_theta_mix "
+                            "WHERE label IN ('transcoded','native_same')"))
+        shifted = int(ch_query("SELECT uniqThetaMerge(s) FROM _t_theta_mix "
+                               "WHERE label IN ('transcoded','native_shift')"))
+        assert same == 1000, "identical sets must dedupe completely"
+        assert shifted == 1500, "50% overlap must be detected"
+    finally:
+        ch_query("DROP TABLE IF EXISTS _t_theta_mix")
+
+
+# -------------------------------------------------------------------------------- Druid
+@pytest.mark.druid
+def test_fixture_rollup_shape(druid_query):
+    row = druid_query(f'SELECT COUNT(*) AS nrows, SUM("count") AS events FROM {FIXTURE}')[0]
+    assert row["nrows"] == EXPECTED_ROWS
+    assert row["events"] == EXPECTED_EVENTS
+
+
+@pytest.mark.druid
+def test_sketch_columns_are_complex_not_finalised(druid_query):
+    """If an ingestion ever finalises the aggregators, these become plain numbers and the
+    whole migration silently has nothing to move."""
+    types = {r["COLUMN_NAME"]: r["DATA_TYPE"] for r in druid_query(
+        f"SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS "
+        f"WHERE TABLE_NAME = '{FIXTURE}'")}
+    assert types["users_hll_k12_hll4"] == "COMPLEX<HLLSketch>"
+    assert types["pages_hll_k14_hll8"] == "COMPLEX<HLLSketch>"
+    assert types["users_theta_16384"] == "COMPLEX<thetaSketch>"
+    assert types["pages_theta_4096"] == "COMPLEX<thetaSketch>"
+
+
+@pytest.mark.druid
+def test_per_column_lg_k_differs_and_is_readable(druid_query):
+    """The fixture mixes lgK 12 and 14 precisely so code cannot assume a default."""
+    from sketch_io import hll_lg_k
+    row = druid_query(f"SELECT users_hll_k12_hll4 AS u, pages_hll_k14_hll8 AS p "
+                      f"FROM {FIXTURE} LIMIT 1")[0]
+    assert hll_lg_k(decode_druid_sketch(row["u"])) == 12
+    assert hll_lg_k(decode_druid_sketch(row["p"])) == 14
+
+
+@pytest.mark.druid
+def test_python_reads_druid_sketches_exactly(druid_query):
+    """datasketches-java 4.2.0 wrote these; the Python binding must agree to float precision."""
+    row = druid_query(
+        f"SELECT users_hll_k12_hll4 AS h, HLL_SKETCH_ESTIMATE(users_hll_k12_hll4) AS he, "
+        f"users_theta_16384 AS t, THETA_SKETCH_ESTIMATE(users_theta_16384) AS te "
+        f"FROM {FIXTURE} WHERE channel = '#en.wikipedia' LIMIT 1")[0]
+
+    from datasketches import compact_theta_sketch
+    assert abs(hll_sketch.deserialize(decode_druid_sketch(row["h"])).get_estimate()
+               - row["he"]) < 1e-6
+    assert abs(compact_theta_sketch.deserialize(decode_druid_sketch(row["t"])).get_estimate()
+               - row["te"]) < 1e-6
+
+
+@pytest.mark.druid
+def test_stored_rollup_sketches_are_sparse(druid_query):
+    """Sparse is the common case in a rollup table, so extraction must handle it."""
+    row = druid_query(f"SELECT users_hll_k12_hll4 AS h FROM {FIXTURE} LIMIT 1")[0]
+    assert decode_druid_sketch(row["h"])[7] & 0x03 != 2
+
+
+# ------------------------------------------------------------------- both systems needed
+@pytest.mark.druid
+@pytest.mark.clickhouse
+def test_theta_seed_hash_matches_across_systems(druid_query, ch_query):
+    """The assumption the entire Theta path rests on. Same seed hash => same key hashes to
+    the same value => cross-system unions actually dedupe."""
+    def seed_hash(sketch_bytes):
+        return struct.unpack_from("<H", sketch_bytes, 6)[0]
+
+    druid_sketch = decode_druid_sketch(
+        druid_query(f"SELECT users_theta_16384 AS t FROM {FIXTURE} LIMIT 1")[0]["t"])
+
+    raw = bytes.fromhex(
+        ch_query("SELECT hex(toString(uniqThetaState(toString(number)))) FROM numbers(1000)"))
+    length, pos = 0, 0
+    shift = 0
+    while True:                       # strip the LEB128 length prefix
+        byte = raw[pos]
+        pos += 1
+        length |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            break
+        shift += 7
+    ch_sketch = raw[pos:pos + length]
+
+    assert seed_hash(druid_sketch) == DS_DEFAULT_SEED_HASH
+    assert seed_hash(ch_sketch) == DS_DEFAULT_SEED_HASH
