@@ -242,10 +242,20 @@ ClickHouse ones. Read it before touching `uniqhll12.py` or either HLL migration.
 with no Python touching the sketch bytes. Every state it produces is byte-identical to the
 Python migrations' (2486 rows, all columns, zero differences). The enabling trick is that
 **`CAST(<String> AS AggregateFunction(...))` deserializes aggregate-state bytes** — undocumented
-as a conversion, but it works for `uniqTheta` and `uniqHLL12` alike. Two caveats live in that
-file's header: `url()` cannot read Druid (POST-only endpoint vs GET-only table function), so one
-transport step stays outside SQL; and the HLL transplant is sparse-input-only and must be
-chunked, or it tries to allocate 24 GiB.
+as a conversion, but it works for `uniqTheta` and `uniqHLL12` alike. One caveat lives in that
+file's header: the HLL transplant is sparse-input-only and must be chunked, or it tries to
+allocate 24 GiB.
+
+**Querying Druid from ClickHouse SQL.** `url()` cannot — Druid's `/druid/v2/sql` is POST-only
+and returns 405 for GET, while `url()` issues GET and has no method or body parameter.
+`clickhouse/druid_query.py` closes the gap via `executable()`: it takes Druid SQL on stdin,
+POSTs it, and returns `objectLines`, which is already valid `JSONEachRow`. That makes Druid
+addressable from SQL — the whole Theta migration runs as one statement with no intermediate
+file (verified byte-identical), and Druid can be joined live against a ClickHouse table.
+Needs `user_scripts_path` (already set for the HLL UDF) and the executable bit.
+`jdbc()` would work in principle — Druid bundles the Avatica driver — but needs the separate
+clickhouse-jdbc-bridge daemon, and whether Avatica exposes `COMPLEX<thetaSketch>` usefully is
+unverified.
 
 ## ClickHouse `uniqHLL12` state format (reverse-engineered)
 

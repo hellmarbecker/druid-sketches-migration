@@ -9,25 +9,32 @@
 -- what the engine can do unaided, and because a SQL-only route avoids deploying anything.
 --
 --
--- WHAT DOES NOT WORK: reading Druid from ClickHouse
+-- READING DRUID FROM CLICKHOUSE
 --
--- `url()` cannot drive Druid. Druid's /druid/v2/sql is POST-with-a-JSON-body only (GET
--- returns 405), and url() issues GET for SELECT -- its signature is
--- (uri, format, structure, compression) plus headers, with no method or body. Adding
--- Content-Type headers does not change the verb. Confirmed both ways: url() against
--- /status/health returns `true`, url() against /druid/v2/sql returns 405.
+-- `url()` cannot do it. Druid's /druid/v2/sql is POST-with-a-JSON-body only (GET returns
+-- 405), and url() issues GET for SELECT -- its signature is (uri, format, structure,
+-- compression) plus headers, with no method or body. Adding Content-Type headers does not
+-- change the verb. Confirmed both ways: url() against /status/health returns `true`, url()
+-- against /druid/v2/sql returns 405.
 --
--- So one non-SQL transport step is unavoidable. Anything works; the cheapest is to land
--- Druid's own output where ClickHouse can see it:
+-- `executable()` can. clickhouse/druid_query.py takes a Druid SQL query on stdin, POSTs it,
+-- and returns objectLines -- which is already valid JSONEachRow. Druid then becomes
+-- addressable from ClickHouse SQL, so a migration is one statement with no intermediate
+-- file, and ad-hoc federated queries (join Druid live against a ClickHouse table) work too.
+-- Needs user_scripts_path in config.xml (already set for hll_merge_udf.py) and the
+-- executable bit on the script. See section 0.
+--
+-- `jdbc()` also exists, and Druid bundles the Avatica driver (avatica-core-1.27.0.jar), but
+-- it is a client of clickhouse-jdbc-bridge -- a separate Java daemon. Not used here: it is
+-- heavier than executable(), and whether Avatica exposes COMPLEX<thetaSketch> in a form the
+-- bridge can map is unverified, whereas executable() demonstrably preserves the bytes.
+--
+-- The file route below still works and needs no script; land Druid's output where ClickHouse
+-- can read it and use file() instead of executable():
 --
 --   curl -s -X POST -H 'Content-Type: application/json' \
---     -d '{"query":"SELECT __time, channel, countryName, isRobot, \"count\", sum_added,
---                    users_theta_16384, pages_theta_4096
---                   FROM wikipedia_rollup_sketches","resultFormat":"objectLines"}' \
+--     -d '{"query":"SELECT ... FROM wikipedia_rollup_sketches","resultFormat":"objectLines"}' \
 --     http://localhost:8888/druid/v2/sql > <user_files_path>/druid_theta.jsonl
---
--- Everything after that point is SQL. Alternatives that keep it SQL-only end to end: a
--- GET->POST proxy in front of Druid, or Druid MSQ exporting to a location ClickHouse reads.
 --
 --
 -- THE ONE FUNCTION THAT MAKES THIS POSSIBLE
@@ -60,6 +67,35 @@
 --                hex(toUInt8(bitAnd(bitShiftRight(v,24),255))))) AS le32
 --   (v -> concat(hex(toUInt8(bitAnd(v,255))),
 --                hex(toUInt8(bitAnd(bitShiftRight(v,8),255))))) AS le16
+
+
+-- ================================================== 0. Querying Druid live from ClickHouse
+-- Everything below reads from file(); swap in this executable() call to read Druid directly
+-- instead. Verified: the whole Theta migration run this way, with no intermediate file,
+-- produces states byte-identical to the file route and to migrate_theta.py (2486 rows).
+--
+--   INSERT INTO rollup_theta_sqlonly
+--   WITH ... same helpers as section 1 ...
+--   SELECT parseDateTimeBestEffort(__time), channel, countryName, isRobot, cnt, sum_added,
+--          to_state(unwrap(users_theta_16384)), to_state(unwrap(pages_theta_4096))
+--   FROM executable('druid_query.py', 'JSONEachRow',
+--        '__time String, channel String, countryName Nullable(String), isRobot String,
+--         cnt UInt64, sum_added Int64, users_theta_16384 String, pages_theta_4096 String',
+--        (SELECT $$SELECT __time, channel, countryName, isRobot, "count" AS cnt, sum_added,
+--                        users_theta_16384, pages_theta_4096
+--                 FROM wikipedia_rollup_sketches$$));
+--
+-- Dollar-quoting ($$...$$) keeps the Druid query readable: its double quotes around
+-- reserved words like "count" would otherwise need escaping inside a ClickHouse literal.
+--
+-- It composes, which the file route does not -- Druid can be joined against ClickHouse:
+--
+--   SELECT d.channel, d.druid_rows, c.ch_users
+--   FROM executable('druid_query.py', 'JSONEachRow', 'channel String, druid_rows UInt64',
+--        (SELECT $$SELECT channel, COUNT(*) AS druid_rows
+--                 FROM wikipedia_rollup_sketches GROUP BY 1$$)) AS d
+--   INNER JOIN (SELECT channel, uniqThetaMerge(users_theta) AS ch_users
+--               FROM wikipedia_rollup_sketches GROUP BY channel) AS c USING (channel);
 
 
 -- ================================================================= 1. Theta -> uniqTheta
