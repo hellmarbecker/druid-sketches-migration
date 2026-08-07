@@ -238,6 +238,15 @@ cross-row merge, so expect ~1.6% RSE instead of ~0.8%. Building a Theta column i
 and the argument for why transplanted sketches merge with each other but not with native
 ClickHouse ones. Read it before touching `uniqhll12.py` or either HLL migration.
 
+`clickhouse/migrate-sketches-sqlonly.sql` — all three migrations expressed as ClickHouse SQL,
+with no Python touching the sketch bytes. Every state it produces is byte-identical to the
+Python migrations' (2486 rows, all columns, zero differences). The enabling trick is that
+**`CAST(<String> AS AggregateFunction(...))` deserializes aggregate-state bytes** — undocumented
+as a conversion, but it works for `uniqTheta` and `uniqHLL12` alike. Two caveats live in that
+file's header: `url()` cannot read Druid (POST-only endpoint vs GET-only table function), so one
+transport step stays outside SQL; and the HLL transplant is sparse-input-only and must be
+chunked, or it tries to allocate 24 GiB.
+
 ## ClickHouse `uniqHLL12` state format (reverse-engineered)
 
 Codec in `uniqhll12.py`; evidence and re-validation in `spikes/reverse_uniqhll12.py`. **This
@@ -274,9 +283,11 @@ Validation is that round-trip, at every cardinality from 17 to 1e6.
 ## HLL transplant path (working — `migrate_hll_transplant.py`)
 
 Druid HLL → `AggregateFunction(uniqHLL12, String)`, queryable with plain `uniqHLL12Merge`.
-Registers are folded to lgK=12 via `hll_union` (never by hand — dropping index bits turns them
-into rank bits, which is not a bucket-wise max), extracted from either the dense array at byte 40
-or the sparse coupon list, then packed.
+Registers are folded to lgK=12 via `hll_union`, extracted from either the dense array at byte 40
+or the sparse coupon list, then packed. A manual fold — max over registers sharing the low lgK
+bits — is also valid here and is what the SQL-only path uses; DataSketches takes the rank from a
+different hash lane than the slot, so it does not depend on the index bits. Prefer `hll_union`
+in Python regardless: correct by construction, and representation-agnostic.
 
 **Verified:**
 
