@@ -110,8 +110,14 @@ LG_K = 12  # ClickHouse precision is fixed at 12, so sources must be folded to m
 def datasketches_registers(sketch_bytes: bytes) -> list[int]:
     """Extract 4096 HLL registers from a Druid/DataSketches sketch, folded to lgK=12.
 
-    Folding is delegated to hll_union rather than done by hand: dropping index bits
-    turns them into rank bits, which is not a plain bucket-wise max.
+    Folding is delegated to hll_union because it is correct by construction and handles
+    every representation uniformly -- not because a manual fold is impossible. DataSketches
+    HLL takes the slot from one 64-bit hash lane and the rank from the other, so the rank
+    does not depend on the index bits, and folding really is a max over registers sharing
+    the low lgK bits. Measured against hll_union at lgK 14 -> 12 and identical at n=20k and
+    n=200k. (That is a property of this layout: in classic HLL, where index and rank come
+    from the same word, dropping index bits does move information into the rank.) The manual
+    fold is what clickhouse/migrate-sketches-sqlonly.sql relies on, having no library.
 
     Handles both sketch representations, and `spikes/reverse_uniqhll12.py` proves the two
     agree (registers of a union == elementwise max of a sparse-derived and a dense-derived

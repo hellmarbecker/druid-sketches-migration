@@ -275,10 +275,16 @@ Theta → HLL is possible but HLL → Theta is not.
 
 ## 5. Consequences for the migration
 
-- **Fold to lgK=12 with `hll_union`, never by hand.** Reducing precision turns dropped index bits
-  into rank bits; it is not a bucket-wise max over grouped registers. Folding the fixture's
-  `lgK=14` column halves its precision (~0.81% → ~1.63% RSE), which is a cost of the transplant
-  path that `migrate_hll.py` avoids.
+- **Fold to lgK=12 with `hll_union` where you have the library.** Not because a manual fold is
+  wrong — it isn't, for DataSketches. The slot comes from one 64-bit hash lane and the rank from
+  the other, so the rank is independent of the index bits and folding *is* a max over registers
+  sharing the low lgK bits (verified identical to `hll_union` at lgK 14 → 12, n=20k and n=200k).
+  That is a property of this layout, not of HLL in general: in classic HLL, where index and rank
+  come off the same word, dropping index bits does move information into the rank. Prefer
+  `hll_union` anyway because it is correct by construction and handles every representation;
+  the manual fold is for environments with no library, such as the SQL-only migration.
+  Either way, folding the fixture's `lgK=14` column halves its precision (~0.81% → ~1.63% RSE),
+  a cost of the transplant path that `migrate_hll.py` avoids.
 - **Convert to `HLL_8` before reading registers**, so the payload is a flat byte array rather
   than `HLL_4`'s nibbles-plus-exceptions.
 - **Clamp ranks to 21.** Statistically irrelevant (P(rank > 21) ≈ 2⁻²¹ per item) but structurally
