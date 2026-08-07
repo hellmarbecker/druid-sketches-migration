@@ -214,6 +214,53 @@ def test_theta_dedupes_across_systems(ch_query):
         ch_query("DROP TABLE IF EXISTS _t_theta_mix")
 
 
+@pytest.mark.druid
+@pytest.mark.clickhouse
+def test_druid_is_queryable_from_clickhouse_sql(ch_query):
+    """clickhouse/druid_query.py makes Druid addressable from ClickHouse SQL via
+    executable(), which is what `url()` cannot do (Druid's SQL endpoint is POST-only).
+
+    Skips rather than fails when the script is not deployed -- it needs user_scripts_path
+    set in config.xml and the executable bit, neither of which is a property of this repo's
+    Python code.
+    """
+    probe = (
+        "SELECT * FROM executable('druid_query.py', 'JSONEachRow', 'c UInt64', "
+        "(SELECT $$SELECT COUNT(*) AS c FROM " + FIXTURE + "$$))"
+    )
+    try:
+        got = ch_query(probe)
+    except RuntimeError as exc:
+        pytest.skip(f"druid_query.py not usable from ClickHouse: {str(exc)[:120]}")
+
+    assert got.isdigit(), f"expected a row count, got {got[:200]}"
+    assert int(got) == EXPECTED_ROWS
+
+    # The point of the script: sketch bytes survive the round trip intact, and can be
+    # transcoded to a uniqTheta state in SQL. Compared against Druid's own estimate, so this
+    # fails if any byte were mangled in transit.
+    got = ch_query(
+        "WITH (L -> multiIf(L < 128, char(L), L < 16384, "
+        "        char(bitOr(bitAnd(L,127),128), bitShiftRight(L,7)), "
+        "        char(bitOr(bitAnd(L,127),128), bitOr(bitAnd(bitShiftRight(L,7),127),128), "
+        "             bitShiftRight(L,14)))) AS leb128 "
+        "SELECT reinterpretAsUInt8(substring(sk, 2, 1)) AS ser_ver, "
+        "       reinterpretAsUInt8(substring(sk, 3, 1)) AS family, "
+        "       finalizeAggregation(CAST(concat(leb128(length(sk)), sk) "
+        "                                AS AggregateFunction(uniqTheta, String))) AS est, "
+        "       any(druid_est) AS druid "
+        "FROM (SELECT base64Decode(trim(BOTH '\"' FROM s)) AS sk, e AS druid_est "
+        "      FROM executable('druid_query.py', 'JSONEachRow', 's String, e Float64', "
+        "        (SELECT $$SELECT users_theta_16384 AS s, "
+        "                        THETA_SKETCH_ESTIMATE(users_theta_16384) AS e "
+        "                 FROM " + FIXTURE + " WHERE channel = '#en.wikipedia' LIMIT 1$$))) "
+        "GROUP BY sk"
+    ).split("\t")
+    ser_ver, family, est, druid = int(got[0]), int(got[1]), int(got[2]), float(got[3])
+    assert (ser_ver, family) == (3, 3), "not a compact DataSketches Theta preamble"
+    assert est == round(druid), f"transcoded estimate {est} != druid {druid}"
+
+
 # -------------------------------------------------------------------------------- Druid
 @pytest.mark.druid
 def test_fixture_rollup_shape(druid_query):
