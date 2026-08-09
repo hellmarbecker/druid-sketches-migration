@@ -16,6 +16,7 @@ import base64
 import struct
 
 import pytest
+import requests
 from datasketches import hll_sketch, hll_union, tgt_hll_type, update_theta_sketch
 
 from sketch_io import decode_druid_sketch, enc_agg_state, enc_string
@@ -259,6 +260,38 @@ def test_druid_is_queryable_from_clickhouse_sql(ch_query):
     ser_ver, family, est, druid = int(got[0]), int(got[1]), int(got[2]), float(got[3])
     assert (ser_ver, family) == (3, 3), "not a compact DataSketches Theta preamble"
     assert est == round(druid), f"transcoded estimate {est} != druid {druid}"
+
+
+@pytest.mark.druid
+@pytest.mark.clickhouse
+def test_druid_reachable_through_the_nginx_shim(ch_query):
+    """nginx/druid-get-to-post.conf lets plain url() query Druid by rewriting GET to POST.
+
+    Skips when the shim is not running -- it is an optional third daemon, not something the
+    repo's code can guarantee. Asserts the sketch bytes survive, not merely that rows come
+    back, since a proxy that mangled the body would still return well-formed JSON.
+    """
+    # Probe the shim directly rather than discovering it through ClickHouse. url() against a
+    # dead upstream blocks for the whole client timeout instead of failing fast, which turns
+    # a missing optional daemon into a two-minute hang and then an error rather than a skip.
+    try:
+        requests.get("http://127.0.0.1:8890/health", timeout=2).raise_for_status()
+    except requests.RequestException as exc:
+        pytest.skip(f"nginx GET->POST shim not reachable on :8890 ({type(exc).__name__})")
+
+    got = ch_query(
+        "SELECT reinterpretAsUInt8(substring(sk, 2, 1)) AS ser_ver, "
+        "       reinterpretAsUInt8(substring(sk, 3, 1)) AS family, count() AS rows "
+        "FROM (SELECT base64Decode(trim(BOTH '\"' FROM users_theta_16384)) AS sk "
+        "      FROM url('http://127.0.0.1:8890/named/rollup-theta', 'JSONEachRow', "
+        "               '__time String, channel String, countryName Nullable(String), "
+        "                isRobot String, cnt UInt64, sum_added Int64, "
+        "                users_theta_16384 String, pages_theta_4096 String')) "
+        "GROUP BY ser_ver, family"
+    )
+    ser_ver, family, rows = (int(x) for x in got.split("\t"))
+    assert (ser_ver, family) == (3, 3), "not a compact DataSketches Theta preamble"
+    assert rows == EXPECTED_ROWS
 
 
 # -------------------------------------------------------------------------------- Druid
