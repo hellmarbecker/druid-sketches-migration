@@ -24,6 +24,14 @@
 -- Needs user_scripts_path in config.xml (already set for hll_merge_udf.py) and the
 -- executable bit on the script. See section 0.
 --
+-- `url()` DOES work behind a GET->POST proxy. nginx/druid-get-to-post.conf is a stock-nginx
+-- shim (proxy_method POST + proxy_set_body) that turns a GET into a Druid query, so plain
+-- url() works with nothing deployed inside ClickHouse. Verified end to end: the Theta
+-- migration run through it is byte-identical to migrate_theta.py. Choose it over
+-- executable() when enabling script execution in ClickHouse is unattractive, or when other
+-- clients also want Druid over GET; choose executable() for ad-hoc SQL, which needs no
+-- URL-encoding and no quote escaping.
+--
 -- `jdbc()` also exists, and Druid bundles the Avatica driver (avatica-core-1.27.0.jar), but
 -- it is a client of clickhouse-jdbc-bridge -- a separate Java daemon. Not used here: it is
 -- heavier than executable(), and whether Avatica exposes COMPLEX<thetaSketch> in a form the

@@ -253,6 +253,15 @@ POSTs it, and returns `objectLines`, which is already valid `JSONEachRow`. That 
 addressable from SQL — the whole Theta migration runs as one statement with no intermediate
 file (verified byte-identical), and Druid can be joined live against a ClickHouse table.
 Needs `user_scripts_path` (already set for the HLL UDF) and the executable bit.
+`nginx/druid-get-to-post.conf` is the other working route: a stock-nginx shim
+(`proxy_method POST` + `proxy_set_body`) that turns a GET into a Druid query, so plain `url()`
+works with nothing deployed inside ClickHouse. Also verified byte-identical end to end. Pick
+the shim when enabling script execution in ClickHouse is unattractive or several clients want
+Druid over GET; pick `executable()` for ad-hoc SQL, which needs no URL-encoding or escaping.
+Three traps are documented in that config: a regex `location` cannot carry a URI in
+`proxy_pass` (use `rewrite … break`), nginx eats one level of backslash escaping so JSON needs
+`\\"`, and ClickHouse globs `*` in URLs (use `COUNT(1)` or `%2A`).
+
 `jdbc()` would work in principle — Druid bundles the Avatica driver — but needs the separate
 clickhouse-jdbc-bridge daemon, and whether Avatica exposes `COMPLEX<thetaSketch>` usefully is
 unverified.
