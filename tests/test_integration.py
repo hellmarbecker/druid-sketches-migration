@@ -144,6 +144,75 @@ def test_transplanted_states_union_with_each_other(ch_query):
 
 
 @pytest.mark.clickhouse
+def test_transplanted_states_roll_up_through_an_incremental_mv(ch_query):
+    """Transplanted states must survive the -MergeState + materialized view pattern.
+
+    This is the shape a real deployment takes: migrate at a fine grain, then let an
+    incremental MV roll up into a coarser AggregatingMergeTree. It exercises paths the
+    other tests do not -- uniqHLL12MergeState producing a *state* rather than a value, an
+    MV firing per inserted block, and the target collapsing those partial states in its own
+    background merge. Nothing here re-reads the source table, so if a partial state were
+    malformed the error would only appear at the rollup.
+
+    Two inserts, not one, because an MV sees only the block being inserted: with a second
+    batch each channel arrives twice and the target has to combine them.
+    """
+    src, agg, mv = "_t_mv_src", "_t_mv_agg", "_t_mv_rollup"
+    ch_query(f"DROP VIEW IF EXISTS {mv}")
+    ch_query(f"DROP TABLE IF EXISTS {src}")
+    ch_query(f"DROP TABLE IF EXISTS {agg}")
+    try:
+        ch_query(f"CREATE TABLE {src} (grp String, s AggregateFunction(uniqHLL12, String)) "
+                 f"ENGINE = AggregatingMergeTree ORDER BY grp")
+        ch_query(f"CREATE TABLE {agg} (grp String, s AggregateFunction(uniqHLL12, String)) "
+                 f"ENGINE = AggregatingMergeTree ORDER BY grp")
+        ch_query(f"CREATE MATERIALIZED VIEW {mv} TO {agg} AS "
+                 f"SELECT grp, uniqHLL12MergeState(s) AS s FROM {src} GROUP BY grp")
+
+        # Group 'a' covers 0..1999 and 'b' 1000..2999, each split across the two batches.
+        batches = [
+            {"a": range(0, 1000), "b": range(1000, 2000)},
+            {"a": range(1000, 2000), "b": range(2000, 3000)},
+        ]
+        for batch in batches:
+            payload = bytearray()
+            for grp, keys in batch.items():
+                sk = hll(f"k{i}" for i in keys)
+                payload += enc_string(grp) + state_from_datasketches(sk.serialize_compact())
+            ch_query(f"INSERT INTO {src} FORMAT RowBinary", data=bytes(payload))
+
+        assert int(ch_query(f"SELECT count() FROM {agg}")) == 4, (
+            "expected one partial state per group per insert, still unmerged")
+
+        def by_group(table):
+            rows = ch_query(f"SELECT grp, uniqHLL12Merge(s) FROM {table} GROUP BY grp "
+                            f"ORDER BY grp").split("\n")
+            return {r.split("\t")[0]: int(r.split("\t")[1]) for r in rows if r}
+
+        direct, via_mv = by_group(src), by_group(agg)
+        assert via_mv == direct, f"MV rollup disagrees with the source: {via_mv} vs {direct}"
+
+        # Both groups really span 2000 distinct keys, so the rollup is not trivially right.
+        for grp, est in via_mv.items():
+            assert abs(est - 2000) / 2000 < 0.05, f"group {grp} estimated {est}, expected ~2000"
+
+        # The target's own part merge must not disturb it either.
+        ch_query(f"OPTIMIZE TABLE {agg} FINAL SETTINGS optimize_throw_if_noop = 1")
+        assert int(ch_query(f"SELECT count() FROM {agg}")) == 2, "partial states did not collapse"
+        assert by_group(agg) == direct, "estimates changed when the target merged its parts"
+
+        # A -MergeState result must itself be a well-formed dense state, or it could not be
+        # merged again at a third level.
+        shape = ch_query(f"SELECT DISTINCT length(toString(s)), "
+                         f"reinterpretAsUInt8(substring(toString(s), 1, 1)) FROM {agg}")
+        assert shape == "2651\t1", f"unexpected rolled-up state shape: {shape}"
+    finally:
+        ch_query(f"DROP VIEW IF EXISTS {mv}")
+        ch_query(f"DROP TABLE IF EXISTS {src}")
+        ch_query(f"DROP TABLE IF EXISTS {agg}")
+
+
+@pytest.mark.clickhouse
 def test_transplanted_and_native_states_must_not_be_mixed(ch_query):
     """Documents the hard constraint by demonstrating the breakage. If this ever stops
     failing, the two systems have converged on a hash and the docs need revisiting."""
