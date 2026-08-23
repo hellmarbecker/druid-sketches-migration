@@ -40,19 +40,38 @@ def test_lg_k_rejects_non_hll_family():
         hll_lg_k(theta.compact().serialize())
 
 
-def test_sparse_and_dense_sources_stay_sparse_and_dense():
-    """Guards the premise of the next test: if both sketches took the same code path, the
-    agreement check below would prove nothing."""
-    sparse = sketch(range(100)).serialize_compact()
-    dense = sketch(range(1000, 20000)).serialize_compact()
-    assert sparse[7] & 0x03 != 2, "expected LIST/SET mode for a small sketch"
-    assert dense[7] & 0x03 == 2, "expected dense HLL mode for a large sketch"
+# "Sparse" is two distinct representations, not one, and LIST is the one that dominates real
+# rollup data: in the fixture it is 84% of the users column and 74% of pages, while dense
+# never occurs at all. Both are exercised below, with n chosen either side of the promotion
+# threshold -- at lgK=12 a sketch is LIST up to 7 distinct values and SET from 8.
+LIST_N, SET_N = 7, 100
+DENSE_RANGE = range(1000, 20000)
+
+# The coupon array is a hash table, so coupons sit at scattered positions rather than packed
+# at the front -- which means the final slot is usually padding. At n=15 it happens to hold a
+# real coupon, so this case is what catches a parser that stops one slot short. Without it,
+# truncating the loop by one passes every other case (verified by mutation).
+SET_LAST_SLOT_N = 15
 
 
-def test_sparse_and_dense_extraction_agree():
+def test_sparse_modes_are_where_the_tests_assume():
+    """Guards the premise of everything below. If DataSketches moved the LIST/SET promotion
+    threshold, the mode-specific tests would silently all run against the same code path."""
+    assert sketch(range(LIST_N)).serialize_compact()[7] & 0x03 == 0, "expected LIST mode"
+    assert sketch(range(SET_N)).serialize_compact()[7] & 0x03 == 1, "expected SET mode"
+    assert sketch(DENSE_RANGE).serialize_compact()[7] & 0x03 == 2, "expected dense HLL mode"
+
+
+@pytest.mark.parametrize("mode,n", [("LIST", LIST_N), ("SET", SET_N),
+                                    ("SET last slot occupied", SET_LAST_SLOT_N)])
+def test_sparse_and_dense_extraction_agree(mode, n):
     """registers(A u B) must equal the elementwise max of the two register arrays -- with A
-    taken through the coupon path and B through the dense path."""
-    a, b = sketch(range(100)), sketch(range(1000, 20000))
+    taken through the coupon path and B through the dense path.
+
+    Run for both sparse representations. They differ in preamble size (LIST is preInts=2,
+    SET is preInts=3), which is exactly the offset the coupon parser has to get right.
+    """
+    a, b = sketch(range(n)), sketch(DENSE_RANGE)
     u = hll_union(LG_K)
     u.update(a)
     u.update(b)
@@ -61,6 +80,70 @@ def test_sparse_and_dense_extraction_agree():
     rb = datasketches_registers(b.serialize_compact())
     ru = datasketches_registers(u.get_result(tgt_hll_type.HLL_8).serialize_compact())
     assert [max(x, y) for x, y in zip(ra, rb)] == ru
+    assert sum(1 for v in ra if v), f"{mode} sketch set no registers"
+
+
+def read_coupons(serialized: bytes) -> list[int]:
+    """Independent re-read of a sparse sketch's coupon array, written from the format spec
+    rather than by calling the parser under test: preInts*4 bytes of preamble, then UInt32
+    coupons. Empty slots are zero (updatable serialisations are padded out to their full
+    allocation), and a real coupon can never be zero because rank 0 is not a valid value.
+    """
+    pre = (serialized[0] & 0x3F) * 4
+    words = [int.from_bytes(serialized[pre + 4 * i:pre + 4 * i + 4], "little")
+             for i in range((len(serialized) - pre) // 4)]
+    return [c for c in words if c]
+
+
+@pytest.mark.parametrize("mode,n", [("LIST", LIST_N), ("SET", SET_N),
+                                    ("SET last slot occupied", SET_LAST_SLOT_N)])
+def test_sparse_extraction_finds_every_coupon(mode, n):
+    """Every coupon in the sketch must land in a register.
+
+    Checked against an independent read of the same bytes rather than against n, because
+    coupons collide: 100 distinct values occupy fewer than 100 registers once two of them
+    share a bucket. Comparing to n would either fail on collisions or need a fudge factor
+    loose enough to hide a parser dropping coupons -- which is the bug this exists to catch,
+    since a wrong preamble offset loses the leading coupon and still looks plausible.
+    """
+    compact = sketch(range(n)).serialize_compact()
+    coupons = read_coupons(compact)
+    assert len(coupons) == n, f"{mode}: expected one coupon per distinct value"
+
+    expected_indices = {c & (BUCKETS - 1) for c in coupons}
+    regs = datasketches_registers(compact)
+    assert {i for i, v in enumerate(regs) if v} == expected_indices, (
+        f"{mode}: registers set do not match the coupons present")
+
+
+def test_updatable_padding_is_not_mistaken_for_coupons():
+    """Sparse updatable sketches pad their coupon array to the full allocation -- n=1
+    occupies 1 of 8 slots -- and datasketches_registers() parses updatable bytes, because it
+    normalises through hll_union. This pins that the registers it produces are exactly the
+    ones the real coupons call for, with padding contributing nothing.
+
+    Note the skip in the parser is defensive rather than load-bearing *here*: a zero word
+    decodes to index 0 with rank 0, and max(register, 0) is a no-op, so removing the skip
+    changes no output (verified by mutation). It is load-bearing in the SQL transplant,
+    which counts map entries to derive the histogram -- there a stray zero coupon would put
+    index 0 in the map and leave the counters summing to 4095.
+    """
+    for n in (1, LIST_N, SET_N):
+        u = hll_union(LG_K)
+        u.update(sketch(range(n)))
+        updatable = u.get_result(tgt_hll_type.HLL_8).serialize_updatable()
+
+        pre = (updatable[0] & 0x3F) * 4
+        slots = (len(updatable) - pre) // 4
+        coupons = read_coupons(updatable)
+        assert slots > len(coupons), (
+            f"n={n}: expected padding, got {slots} slots for {len(coupons)} coupons")
+
+        regs = datasketches_registers(sketch(range(n)).serialize_compact())
+        set_indices = {i for i, v in enumerate(regs) if v}
+        assert set_indices == {c & (BUCKETS - 1) for c in coupons}
+        assert 0 not in set_indices or any(c & (BUCKETS - 1) == 0 for c in coupons), (
+            f"n={n}: register 0 was set with no coupon mapping to it -- padding was counted")
 
 
 def test_extraction_returns_full_register_array():
