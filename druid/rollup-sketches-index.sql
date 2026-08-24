@@ -9,6 +9,13 @@
 -- It writes wikipedia_rollup_sketches_sql so it cannot clobber the fixture. Change the
 -- REPLACE INTO target to wikipedia_rollup_sketches to rebuild the fixture itself.
 --
+-- ONE COLUMN CANNOT BE REPRODUCED HERE. The JSON spec builds both quantiles families, but
+-- Druid 37 exposes a SQL aggregator only for the classic one (DS_QUANTILES_SKETCH). KLL is
+-- reachable from a native ingestion spec and from a scan query, but has no SQL aggregation
+-- function -- DS_KLL_DOUBLES_SKETCH, KLL_SKETCH and DS_KLL_SKETCH are all unknown, and
+-- passing a KLL column to DS_QUANTILES_SKETCH fails with a ClassCastException. So this
+-- translation produces eleven of the JSON spec's twelve columns; added_kll_k200 is absent.
+--
 --
 -- HOW THE JSON SPEC MAPS ONTO SQL
 --
@@ -76,7 +83,10 @@ SELECT
     DS_HLL("user", 12, 'HLL_4')             AS "users_hll_k12_hll4",
     DS_HLL("page", 14, 'HLL_8')             AS "pages_hll_k14_hll8",
     DS_THETA("user", 16384)                 AS "users_theta_16384",
-    DS_THETA("page", 4096)                  AS "pages_theta_4096"
+    DS_THETA("page", 4096)                  AS "pages_theta_4096",
+    -- Classic quantiles has a SQL aggregator; KLL does not, so the JSON spec's
+    -- added_kll_k200 column cannot be reproduced here. See the note below.
+    DS_QUANTILES_SKETCH("added", 256)       AS "added_quantiles_k256"
 
 FROM TABLE(
     EXTERN(

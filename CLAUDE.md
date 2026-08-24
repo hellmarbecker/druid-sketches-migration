@@ -93,6 +93,7 @@ Then any of the migrations (each migrates and self-verifies, ending in `ALL CHEC
 .venv/bin/python migrate_theta.py           # Theta -> uniqTheta (lossless)
 .venv/bin/python migrate_hll.py             # HLL  -> pre-merged estimates + carried bytes
 .venv/bin/python migrate_hll_transplant.py  # HLL  -> native uniqHLL12 states
+.venv/bin/python migrate_quantiles.py       # quantiles -> carried bytes + native t-digest
 .venv/bin/python spikes/reverse_uniqhll12.py   # re-validate the uniqHLL12 format
 ```
 
@@ -105,14 +106,16 @@ Its header documents the submit recipe and two context settings that matter —
 `maxNumTasks: 2` (exceeding the middleManager's `druid.worker.capacity` deadlocks silently).
 
 `druid/rollup-sketches-index.json` builds `wikipedia_rollup_sketches` from the bundled wikiticker
-sample: HOUR rollup, 3 dimensions, 39,244 events → 2,486 rows (15.8x). It carries **four** sketch
+sample: HOUR rollup, 3 dimensions, 39,244 events → 2,486 rows (15.8x). It carries **six** sketch
 columns with deliberately different parameters (`lgK` 12/14, `HLL_4`/`HLL_8`, theta `size`
-16384/4096) so code cannot get away with assuming defaults.
+16384/4096) so code cannot get away with assuming defaults, plus **two quantiles columns over
+the same field** — classic `quantilesDoublesSketch` at k=256 and `KllDoublesSketch` at k=200 —
+so the two families can be compared directly.
 
 ## Current state
 
-Three working migration paths, each a self-verifying script at the repo root:
-`migrate_theta.py`, `migrate_hll.py`, `migrate_hll_transplant.py`. Shared plumbing lives in
+Four working migration paths, each a self-verifying script at the repo root:
+`migrate_theta.py`, `migrate_hll.py`, `migrate_hll_transplant.py`, `migrate_quantiles.py`. Shared plumbing lives in
 `sketch_io.py` (Druid reads, ClickHouse writes, RowBinary encoders) and `uniqhll12.py` (the
 reverse-engineered ClickHouse HLL codec). `spikes/` holds the investigations that produced the
 format findings; `druid/` and `clickhouse/` hold fixture config.
@@ -328,6 +331,61 @@ correction to the same registers. The pre-merge + UDF path reproduces source val
 is mergeable with anything, but needs a UDF process and pre-materialised grains. Also note the
 lgK=14 `pages` column is folded to 12 here, halving its precision (~0.81% → ~1.63% RSE);
 `migrate_hll.py` preserves lgK=14.
+
+## Quantiles path (working — `migrate_quantiles.py`)
+
+Druid `quantilesDoublesSketch` / `KllDoublesSketch` → carried bytes **and** a native
+`AggregateFunction(quantileTDigestWeighted, Float64, UInt64)`.
+
+ClickHouse has no DataSketches quantiles or KLL, so there is no byte-level transcode — the
+same starting point as HLL. **But quantiles are the easy case**, because of what the sketch
+keeps: actual data values, where HLL keeps only a max rank per bucket. Values can be replayed;
+hashes cannot.
+
+**The consequence is that the HLL transplant's hard rule does not apply here.** A state built
+from replayed values is a genuine native t-digest, so it merges correctly with states built
+from raw data — verified in `verify()`. No "never mix with native states" constraint.
+
+**How.** Sample the sketch's quantile function at up to 1000 evenly spaced ranks
+(`(i+0.5)/m`), giving `(value, weight)` pairs whose weights sum to exactly `n`, then let
+**ClickHouse** build the t-digest from them via `quantileTDigestWeightedState`. Building the
+state in SQL rather than constructing its bytes keeps it a real native state and avoids
+reverse-engineering a second undocumented format.
+
+**Below the sample cap the replay is exact** — it returns the original observations. At the
+fixture's grain (~16 values per rollup row, against k=256) that means the migration is
+carrying the actual data, not an approximation.
+
+**Accuracy, against exact quantiles computed from the raw wikiticker file:**
+
+| level | exact | Druid k=256 | this migration |
+| --- | --- | --- | --- |
+| p50 | 18.0 | 18.0 | 18.0 |
+| p90 | 356.0 | 343.0 (−3.7%) | 355.3 (−0.2%) |
+| p99 | 3813.0 | 3191.0 (−16.3%) | 3793.2 (−0.5%) |
+
+The migration is *more accurate than the source it reads*, because Druid's number comes from
+merging 2486 k=256 sketches and that is where the tail resolution goes. **So Druid's own
+answer is not ground truth for this path** — an earlier `verify()` compared against it by
+percentage and failed the better answer.
+
+**Two traps worth not rediscovering:**
+
+- **Do not pin `get_min_value()`/`get_max_value()` as extra samples.** It looks like a
+  safeguard for the untouched outer slices, but the outermost samples already stand for them,
+  so it injects mass rather than replacing it. Measured: merged p99 went 3793 → 5487.
+- **Compare quantiles in rank space, never by value.** On tied data a quantile is an interval
+  of ranks, not a point: the fixture puts 15% of its mass on the single value 18.0, giving it
+  the interval [0.3951, 0.5444]. DataSketches returns 32.0 there and t-digest returns 18.0;
+  both are correct, and the exact median is 18.0. `valid_quantile()` implements the textbook
+  test `P(X<v) <= L <= P(X<=v)`; note `get_rank(v)` is the exclusive side, so the inclusive
+  side needs `math.nextafter`.
+
+**KLL is carried but not replayed.** Druid 37 has no SQL aggregator for KLL — `DS_KLL_SKETCH`
+and friends do not exist, and passing a KLL column to `DS_QUANTILES_SKETCH` throws a
+`ClassCastException`. It is readable as a raw column and via the native ingestion spec, so
+the bytes are carried losslessly, but `druid/rollup-sketches-index.sql` cannot reproduce that
+column at all.
 
 ## HLL migration strategy
 

@@ -56,6 +56,21 @@
           "size": 16384
         },
         {
+          "comment": "Two quantiles families over the SAME field, so they can be compared against each other and against the raw distribution. Classic quantiles at non-default k=256.",
+          "type": "quantilesDoublesSketch",
+          "name": "added_quantiles_k256",
+          "fieldName": "added",
+          "k": 256
+        },
+        {
+          "comment": "KLL over the same field at its default k=200 -- a different family with a different binary format.",
+          "type": "KllDoublesSketch",
+          "name": "added_kll_k200",
+          "fieldName": "added",
+          "k": 200
+        },
+
+        {
           "type": "thetaSketch",
           "name": "pages_theta_4096",
           "fieldName": "page",
