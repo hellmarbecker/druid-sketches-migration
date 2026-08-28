@@ -11,6 +11,7 @@ import base64
 import struct
 
 import pytest
+from datasketches import update_theta_sketch
 
 from sketch_io import (
     decode_druid_sketch, enc_agg_state, enc_bytes, enc_datetime_iso, enc_float64,
@@ -121,3 +122,49 @@ def test_esc_escapes_quotes_and_backslashes():
     assert esc("plain") == "'plain'"
     assert esc("it's") == r"'it\'s'"
     assert esc("back\\slash") == r"'back\\slash'"
+
+
+# ---------------------------------------------------------------------- TSV encoding
+# migrate_theta.py can send states as base64 text instead of raw bytes. TSV is
+# delimiter-separated, so a value carrying a tab or newline would silently invent columns
+# or rows -- the failure is a misparse, not an error, which is why these are spelled out.
+
+def test_tsv_escape_covers_every_structural_character():
+    from migrate_theta import tsv_escape
+    assert tsv_escape("plain") == "plain"
+    assert tsv_escape("a\tb") == r"a\tb"
+    assert tsv_escape("a\nb") == r"a\nb"
+    assert tsv_escape("a\rb") == r"a\rb"
+    # Backslash must be escaped first, or escaping the others would double-escape it.
+    assert tsv_escape("a\\b") == r"a\\b"
+    assert tsv_escape("a\\tb") == r"a\\tb", "a literal backslash-t must not become a tab"
+
+
+def test_tsv_row_shape_and_null_sentinel():
+    from migrate_theta import tsv_row
+    sk = update_theta_sketch(14)
+    for i in range(50):
+        sk.update(f"v{i}")
+    b64 = '"' + base64.b64encode(sk.compact().serialize()).decode() + '"'
+
+    line = tsv_row(["2015-09-12T15:00:00.000Z", "#en.wikipedia", None, "false",
+                    42, -7, b64, b64]).decode()
+    assert line.endswith("\n")
+    fields = line.rstrip("\n").split("\t")
+    assert len(fields) == 8, "column count must match the input() structure"
+    assert fields[0] == "1442070000", "DateTime travels as an epoch second"
+    assert fields[2] == "\\N", "a NULL dimension must use the unquoted sentinel"
+    assert fields[5] == "-7", "sum_added is Int64 and can be negative"
+    # The state round-trips through base64 back to the bytes RowBinary would have sent.
+    assert base64.b64decode(fields[6]) == enc_agg_state(base64.b64decode(b64.strip('"')))
+
+
+def test_tsv_row_escapes_a_dimension_containing_a_tab():
+    """A dimension value with a tab must not add a column."""
+    from migrate_theta import tsv_row
+    sk = update_theta_sketch(14)
+    sk.update("x")
+    b64 = '"' + base64.b64encode(sk.compact().serialize()).decode() + '"'
+    line = tsv_row(["2015-09-12T15:00:00.000Z", "we\tird", "co\\untry", "fa\nlse",
+                    1, 0, b64, b64]).decode()
+    assert len(line.rstrip("\n").split("\t")) == 8

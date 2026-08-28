@@ -240,6 +240,62 @@ def test_transplanted_and_native_states_must_not_be_mixed(ch_query):
 
 
 @pytest.mark.clickhouse
+def test_both_wire_formats_land_identical_states(ch_query):
+    """migrate_theta.py --format rowbinary and --format tsv must be interchangeable.
+
+    The two take genuinely different routes: one hands ClickHouse raw state bytes at a fixed
+    byte offset, the other sends base64 text through input() and lets CAST deserialise it.
+    The switch is only safe if they agree byte for byte, so that is what is asserted --
+    equal estimates would not be enough, since two differently-truncated states can still
+    estimate the same.
+    """
+    from migrate_theta import INPUT_STRUCTURE, enc_row, tsv_row
+
+    # A Druid-shaped row: sketch columns arrive as base64 inside a quoted JSON string.
+    def quoted(sk):
+        return '"' + base64.b64encode(sk.compact().serialize()).decode() + '"'
+
+    users, pages = update_theta_sketch(14), update_theta_sketch(12)
+    for i in range(700):
+        users.update(f"u{i}")
+    for i in range(300):
+        pages.update(f"p{i}")
+    row = ["2015-09-12T15:00:00.000Z", "#en.wikipedia", None, "false", 42, -7,
+           quoted(users), quoted(pages)]
+
+    ddl = ("(ts DateTime, channel String, countryName Nullable(String), isRobot String, "
+           " cnt SimpleAggregateFunction(sum, UInt64), "
+           " sum_added SimpleAggregateFunction(sum, Int64), "
+           " users_theta AggregateFunction(uniqTheta, String), "
+           " pages_theta AggregateFunction(uniqTheta, String)) "
+           "ENGINE = AggregatingMergeTree ORDER BY (channel, countryName, isRobot, ts) "
+           "SETTINGS allow_nullable_key = 1")
+    for name in ("_t_fmt_rb", "_t_fmt_tsv"):
+        ch_query(f"DROP TABLE IF EXISTS {name}")
+        ch_query(f"CREATE TABLE {name} {ddl}")
+    try:
+        ch_query("INSERT INTO _t_fmt_rb FORMAT RowBinary", data=enc_row(row))
+        ch_query(
+            "INSERT INTO _t_fmt_tsv SELECT ts, channel, countryName, isRobot, cnt, sum_added, "
+            "CAST(base64Decode(u) AS AggregateFunction(uniqTheta, String)), "
+            "CAST(base64Decode(p) AS AggregateFunction(uniqTheta, String)) "
+            f"FROM input('{INPUT_STRUCTURE}') FORMAT TSV",
+            data=tsv_row(row))
+
+        rb = ch_query("SELECT hex(toString(users_theta)), hex(toString(pages_theta)), "
+                      "toUnixTimestamp(ts), isNull(countryName), sum_added FROM _t_fmt_rb")
+        tsv = ch_query("SELECT hex(toString(users_theta)), hex(toString(pages_theta)), "
+                       "toUnixTimestamp(ts), isNull(countryName), sum_added FROM _t_fmt_tsv")
+        assert rb == tsv, "the two wire formats disagree"
+        # Guard the guard: a row that failed to land would make both sides trivially equal.
+        assert rb and rb.split("\t")[0], "no state came back from the RowBinary path"
+        assert int(ch_query("SELECT uniqThetaMerge(users_theta) FROM _t_fmt_rb")) == 700
+    finally:
+        for name in ("_t_fmt_rb", "_t_fmt_tsv"):
+            ch_query(f"DROP TABLE IF EXISTS {name}")
+
+
+@pytest.mark.clickhouse
 def test_uniqtheta_state_is_a_bare_length_prefixed_sketch(ch_query):
     """The whole Theta write path is varint(len) + compact sketch, with no wrapper."""
     ch_query("DROP TABLE IF EXISTS _t_theta")

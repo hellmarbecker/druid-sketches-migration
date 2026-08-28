@@ -91,6 +91,7 @@ Then any of the migrations (each migrates and self-verifies, ending in `ALL CHEC
 
 ```bash
 .venv/bin/python migrate_theta.py           # Theta -> uniqTheta (lossless)
+.venv/bin/python migrate_theta.py --format tsv   # same, via base64 text + CAST
 .venv/bin/python migrate_hll.py             # HLL  -> pre-merged estimates + carried bytes
 .venv/bin/python migrate_hll_transplant.py  # HLL  -> native uniqHLL12 states
 .venv/bin/python migrate_quantiles.py       # quantiles -> carried bytes + native t-digest
@@ -201,6 +202,18 @@ the HLL problem entirely.
 
 Druid Theta → `AggregateFunction(uniqTheta, String)`, end-to-end with self-verification.
 All checks pass on the fixture; re-run it after upgrading either system.
+
+**Two wire formats, `--format rowbinary` (default) or `--format tsv`.** They produce
+byte-identical states — asserted by `test_both_wire_formats_land_identical_states`, which
+compares the stored bytes rather than the estimates, since two differently-truncated states
+can still estimate the same. On the fixture: 0.62 MB vs 0.79 MB on the wire.
+
+`rowbinary` hands over raw state bytes and needs nothing from SQL, but is **positional and
+headerless** — a column-order or type mismatch misparses silently rather than raising.
+`tsv` sends base64 through `input()` and lets `CAST(… AS AggregateFunction(…))` deserialise,
+giving named columns and a greppable payload for ~27% more bytes, at the cost of needing TSV
+escaping done properly. `RowBinaryWithNamesAndTypes` is the untaken middle ground: binary
+compactness plus a header ClickHouse validates; it also produced identical states when tested.
 
 **The encoding.** A `uniqTheta` aggregate state in `RowBinary` is exactly
 `LEB128(len(sketch)) + <compact DataSketches Theta bytes>` — nothing else, no wrapper. So the
