@@ -11,13 +11,48 @@ The one lossy edge: ClickHouse's uniqTheta has a hard-wired nominal k=4096, so m
 across rows downsamples anything Druid built with a larger `size`. Stored states keep
 their original precision; only merges degrade. Verified in verify() below.
 
-Run:  .venv/bin/python migrate_theta.py
+RowBinary is not the only way to land these states -- see WIRE FORMATS below.
+
+Run:  .venv/bin/python migrate_theta.py [--format rowbinary|tsv]
 Needs Druid + ClickHouse running (see CLAUDE.md).
+
+
+WIRE FORMATS
+
+An aggregate state can reach ClickHouse either as raw bytes in a binary format, or as text
+that SQL converts on the way in. Both are implemented here and produce byte-identical
+states; `--format` picks between them. Measured on the fixture's 2486 rows:
+
+    rowbinary   0.62 MB   raw state bytes, positional, no SQL-side work
+    tsv         0.79 MB   base64 text, converted by CAST(... AS AggregateFunction(...))
+
+`rowbinary` is the most compact and needs nothing from SQL, but it is **positional and
+headerless**: column order and types must match the DDL exactly, and a mismatch does not
+raise -- it misparses silently. The encoders in sketch_io.py exist to get that layout right,
+down to Nullable writing its flag byte only when the value is non-null.
+
+`tsv` sends base64 through the input() table function and lets ClickHouse deserialise:
+
+    INSERT INTO t
+    SELECT ..., CAST(base64Decode(u) AS AggregateFunction(uniqTheta, String))
+    FROM input('... u String, p String') FORMAT TSV
+
+Named columns, and a payload you can grep and diff when a row looks wrong. It costs ~27%
+more bytes here and needs TSV escaping done properly. Note that CAST wants the LEB128 length
+prefix, so `enc_agg_state` is applied either way -- though it could equally be built in SQL
+with concat(leb128(length(s)), s), as clickhouse/migrate-sketches-sqlonly.sql does.
+
+If you want binary compactness without the positional hazard, RowBinaryWithNamesAndTypes
+carries a header ClickHouse validates against the target; it is not implemented here, but it
+also produced identical states when tested.
 """
 
 from __future__ import annotations
 
+import argparse
+import base64
 import sys
+from datetime import datetime, timezone
 
 from datasketches import update_theta_sketch
 
@@ -35,6 +70,13 @@ SELECT_COLS = [
     "__time", "channel", "countryName", "isRobot",
     '"count"', "sum_added", "users_theta_16384", "pages_theta_4096",
 ]
+
+# Column list for the TSV path's input() call. Names are arbitrary -- only the order and the
+# types have to line up with what the SELECT below consumes.
+INPUT_STRUCTURE = (
+    "ts DateTime, channel String, countryName Nullable(String), isRobot String, "
+    "cnt UInt64, sum_added Int64, u String, p String"
+)
 
 DDL = f"""
 CREATE TABLE IF NOT EXISTS {TARGET} (
@@ -70,25 +112,72 @@ def enc_row(row: list) -> bytes:
     )
 
 
+# ------------------------------------------------------------------------ TSV encoding
+def tsv_escape(value: str) -> str:
+    """TSV is delimiter-separated text, so anything that could be read as structure has to be
+    escaped. The fixture's dimensions happen to contain none of these characters, which is
+    exactly why it is worth doing rather than discovering later on data that does."""
+    return (value.replace("\\", "\\\\").replace("\t", "\\t")
+                 .replace("\n", "\\n").replace("\r", "\\r"))
+
+
+def tsv_row(row: list) -> bytes:
+    """One TSV line. States travel as base64, which contains no tab, newline or backslash,
+    so it needs no escaping of its own. NULL is the unquoted \\N sentinel."""
+    ts, channel, country, is_robot, cnt, added, users, pages = row
+    epoch = int(datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                .astimezone(timezone.utc).timestamp())
+    fields = [
+        str(epoch),
+        tsv_escape(channel or ""),
+        "\\N" if country is None else tsv_escape(country),
+        tsv_escape(is_robot or ""),
+        str(cnt),
+        str(added),
+        base64.b64encode(enc_agg_state(decode_druid_sketch(users))).decode(),
+        base64.b64encode(enc_agg_state(decode_druid_sketch(pages))).decode(),
+    ]
+    return ("\t".join(fields) + "\n").encode()
+
+
 # --------------------------------------------------------------------------- migration
-def migrate() -> int:
+FORMATS = {
+    # name: (row encoder, INSERT statement)
+    "rowbinary": (
+        enc_row,
+        f"INSERT INTO {TARGET} FORMAT RowBinary",
+    ),
+    "tsv": (
+        tsv_row,
+        # input() exposes the incoming rows so SQL can convert them; the states arrive as
+        # base64 text and CAST turns them back into aggregate states.
+        f"INSERT INTO {TARGET} SELECT ts, channel, countryName, isRobot, cnt, sum_added, "
+        f"CAST(base64Decode(u) AS AggregateFunction(uniqTheta, String)), "
+        f"CAST(base64Decode(p) AS AggregateFunction(uniqTheta, String)) "
+        f"FROM input('{INPUT_STRUCTURE}') FORMAT TSV",
+    ),
+}
+
+
+def migrate(wire_format: str = "rowbinary") -> int:
+    encode, insert = FORMATS[wire_format]
     ch(f"DROP TABLE IF EXISTS {TARGET}")
     ch(DDL)
 
     query = f"SELECT {', '.join(SELECT_COLS)} FROM {SOURCE}"
-    insert = f"INSERT INTO {TARGET} FORMAT RowBinary"
-
-    batch, total = bytearray(), 0
+    batch, total, sent = bytearray(), 0, 0
     for row in druid_rows(query):
-        batch += enc_row(row)
+        batch += encode(row)
         total += 1
         if total % BATCH_ROWS == 0:
+            sent += len(batch)
             ch(insert, data=bytes(batch))
             batch.clear()
             print(f"  ... {total} rows")
     if batch:
+        sent += len(batch)
         ch(insert, data=bytes(batch))
-    print(f"  migrated {total} rows")
+    print(f"  migrated {total} rows via {wire_format} ({sent / 1e6:.2f} MB on the wire)")
     return total
 
 
@@ -189,9 +278,15 @@ def verify(migrated: int) -> bool:
     return bool(ok)
 
 
-def main() -> int:
-    print(f"=== migrating {SOURCE} -> ClickHouse {TARGET} ===")
-    total = migrate()
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--format", dest="wire_format", choices=sorted(FORMATS),
+                        default="rowbinary",
+                        help="how the aggregate states reach ClickHouse (see module docstring)")
+    args = parser.parse_args(argv)
+
+    print(f"=== migrating {SOURCE} -> ClickHouse {TARGET} (format: {args.wire_format}) ===")
+    total = migrate(args.wire_format)
     ok = verify(total)
     print(f"\n{'ALL CHECKS PASSED' if ok else 'CHECKS FAILED'}")
     return 0 if ok else 1
