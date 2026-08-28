@@ -37,10 +37,16 @@ down to Nullable writing its flag byte only when the value is non-null.
     SELECT ..., CAST(base64Decode(u) AS AggregateFunction(uniqTheta, String))
     FROM input('... u String, p String') FORMAT TSV
 
-Named columns, and a payload you can grep and diff when a row looks wrong. It costs ~27%
-more bytes here and needs TSV escaping done properly. Note that CAST wants the LEB128 length
-prefix, so `enc_agg_state` is applied either way -- though it could equally be built in SQL
-with concat(leb128(length(s)), s), as clickhouse/migrate-sketches-sqlonly.sql does.
+Named columns, and a payload you can grep and diff when a row looks wrong, for ~27% more
+bytes and the obligation to escape properly.
+
+The two paths also differ in *who knows the state layout*. RowBinary has to produce it
+client-side, LEB128 prefix and all, which is what `enc_agg_state` is for. The TSV path sends
+Druid's sketch bytes untouched and builds the prefix in SQL with
+`concat(leb128(length(s)), s)` -- the same construction as
+clickhouse/migrate-sketches-sqlonly.sql -- so the client moves bytes and nothing more. That
+is the more interesting difference: it is the one that would survive ClickHouse changing how
+it frames a state.
 
 If you want binary compactness without the positional hazard, RowBinaryWithNamesAndTypes
 carries a header ClickHouse validates against the target; it is not implemented here, but it
@@ -122,8 +128,16 @@ def tsv_escape(value: str) -> str:
 
 
 def tsv_row(row: list) -> bytes:
-    """One TSV line. States travel as base64, which contains no tab, newline or backslash,
-    so it needs no escaping of its own. NULL is the unquoted \\N sentinel."""
+    """One TSV line, carrying Druid's sketch bytes unchanged.
+
+    The sketches go out exactly as Druid produced them -- no LEB128 length prefix, no
+    aggregate-state framing. SQL adds that on arrival, so this path needs no knowledge of
+    how ClickHouse frames a uniqTheta state; it only has to move bytes. Contrast the
+    RowBinary encoder, which must produce the state layout itself.
+
+    base64 contains no tab, newline or backslash, so the payload needs no escaping of its
+    own. NULL is the unquoted \\N sentinel.
+    """
     ts, channel, country, is_robot, cnt, added, users, pages = row
     epoch = int(datetime.fromisoformat(ts.replace("Z", "+00:00"))
                 .astimezone(timezone.utc).timestamp())
@@ -134,8 +148,8 @@ def tsv_row(row: list) -> bytes:
         tsv_escape(is_robot or ""),
         str(cnt),
         str(added),
-        base64.b64encode(enc_agg_state(decode_druid_sketch(users))).decode(),
-        base64.b64encode(enc_agg_state(decode_druid_sketch(pages))).decode(),
+        base64.b64encode(decode_druid_sketch(users)).decode(),
+        base64.b64encode(decode_druid_sketch(pages)).decode(),
     ]
     return ("\t".join(fields) + "\n").encode()
 
@@ -149,11 +163,21 @@ FORMATS = {
     ),
     "tsv": (
         tsv_row,
-        # input() exposes the incoming rows so SQL can convert them; the states arrive as
-        # base64 text and CAST turns them back into aggregate states.
-        f"INSERT INTO {TARGET} SELECT ts, channel, countryName, isRobot, cnt, sum_added, "
-        f"CAST(base64Decode(u) AS AggregateFunction(uniqTheta, String)), "
-        f"CAST(base64Decode(p) AS AggregateFunction(uniqTheta, String)) "
+        # input() exposes the incoming rows so SQL can convert them. The client sends
+        # Druid's sketch bytes as-is; the LEB128 length prefix that CAST requires is built
+        # here, keeping the state layout entirely on the ClickHouse side. Same construction
+        # as clickhouse/migrate-sketches-sqlonly.sql, verified against ClickHouse's own
+        # prefixes (8016 -> D03E, 16384 -> 808001).
+        f"INSERT INTO {TARGET} "
+        f"WITH (L -> multiIf(L < 128, char(L), "
+        f"                   L < 16384, char(bitOr(bitAnd(L, 127), 128), bitShiftRight(L, 7)), "
+        f"                   char(bitOr(bitAnd(L, 127), 128), "
+        f"                        bitOr(bitAnd(bitShiftRight(L, 7), 127), 128), "
+        f"                        bitShiftRight(L, 14)))) AS leb128, "
+        f"     base64Decode(u) AS ub, base64Decode(p) AS pb "
+        f"SELECT ts, channel, countryName, isRobot, cnt, sum_added, "
+        f"CAST(concat(leb128(length(ub)), ub) AS AggregateFunction(uniqTheta, String)), "
+        f"CAST(concat(leb128(length(pb)), pb) AS AggregateFunction(uniqTheta, String)) "
         f"FROM input('{INPUT_STRUCTURE}') FORMAT TSV",
     ),
 }

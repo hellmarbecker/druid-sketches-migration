@@ -59,6 +59,14 @@ end-to-end migration against live data. The suite pins the units those scripts a
 Tests that touch ClickHouse create and drop their own `_t_*` tables and never write to the
 migration targets.
 
+**If you mutation-test (edit a module, run the suite, restore), disable the bytecode cache.**
+Python invalidates `__pycache__` on mtime *and size*, so a mutation that keeps the file the
+same length and is restored within the same second leaves a stale `.pyc` behind — later runs
+then import the mutated bytecode while the source on disk reads correctly. That produced a
+genuinely baffling failure here: `migrate_theta.py` passed when run as a script (`__main__`
+is never loaded from cache) while the tests that `import` it failed. Run mutations with
+`PYTHONDONTWRITEBYTECODE=1` and clear `__pycache__` between iterations.
+
 ### Druid test fixture
 
 `druid-datasketches` is already in the `loadList` of `$DRUID_HOME/conf/druid/auto`, so no config
@@ -212,7 +220,11 @@ can still estimate the same. On the fixture: 0.62 MB vs 0.79 MB on the wire.
 headerless** — a column-order or type mismatch misparses silently rather than raising.
 `tsv` sends base64 through `input()` and lets `CAST(… AS AggregateFunction(…))` deserialise,
 giving named columns and a greppable payload for ~27% more bytes, at the cost of needing TSV
-escaping done properly. `RowBinaryWithNamesAndTypes` is the untaken middle ground: binary
+escaping done properly. The two also differ in **who knows the state layout**: RowBinary must
+build the LEB128 prefix client-side (that is what `enc_agg_state` is for), while the TSV path
+ships Druid's sketch bytes untouched and builds the prefix in SQL with
+`concat(leb128(length(s)), s)`, the same construction as the SQL-only reference. That is the
+difference that would survive ClickHouse changing how it frames a state. `RowBinaryWithNamesAndTypes` is the untaken middle ground: binary
 compactness plus a header ClickHouse validates; it also produced identical states when tested.
 
 **The encoding.** A `uniqTheta` aggregate state in `RowBinary` is exactly

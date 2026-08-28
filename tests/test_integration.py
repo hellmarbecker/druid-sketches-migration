@@ -249,7 +249,7 @@ def test_both_wire_formats_land_identical_states(ch_query):
     equal estimates would not be enough, since two differently-truncated states can still
     estimate the same.
     """
-    from migrate_theta import INPUT_STRUCTURE, enc_row, tsv_row
+    from migrate_theta import FORMATS
 
     # A Druid-shaped row: sketch columns arrive as base64 inside a quoted JSON string.
     def quoted(sk):
@@ -274,13 +274,11 @@ def test_both_wire_formats_land_identical_states(ch_query):
         ch_query(f"DROP TABLE IF EXISTS {name}")
         ch_query(f"CREATE TABLE {name} {ddl}")
     try:
-        ch_query("INSERT INTO _t_fmt_rb FORMAT RowBinary", data=enc_row(row))
-        ch_query(
-            "INSERT INTO _t_fmt_tsv SELECT ts, channel, countryName, isRobot, cnt, sum_added, "
-            "CAST(base64Decode(u) AS AggregateFunction(uniqTheta, String)), "
-            "CAST(base64Decode(p) AS AggregateFunction(uniqTheta, String)) "
-            f"FROM input('{INPUT_STRUCTURE}') FORMAT TSV",
-            data=tsv_row(row))
+        # Take the encoders and statements from FORMATS rather than restating them, so
+        # this cannot pass while production does something else.
+        for table, fmt in (("_t_fmt_rb", "rowbinary"), ("_t_fmt_tsv", "tsv")):
+            encode, insert = FORMATS[fmt]
+            ch_query(insert.replace("wikipedia_rollup_sketches", table, 1), data=encode(row))
 
         rb = ch_query("SELECT hex(toString(users_theta)), hex(toString(pages_theta)), "
                       "toUnixTimestamp(ts), isNull(countryName), sum_added FROM _t_fmt_rb")

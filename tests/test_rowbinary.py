@@ -155,8 +155,11 @@ def test_tsv_row_shape_and_null_sentinel():
     assert fields[0] == "1442070000", "DateTime travels as an epoch second"
     assert fields[2] == "\\N", "a NULL dimension must use the unquoted sentinel"
     assert fields[5] == "-7", "sum_added is Int64 and can be negative"
-    # The state round-trips through base64 back to the bytes RowBinary would have sent.
-    assert base64.b64decode(fields[6]) == enc_agg_state(base64.b64decode(b64.strip('"')))
+    # The sketch travels unframed: exactly Druid's bytes, with no LEB128 prefix. SQL adds
+    # that on arrival, so a prefix appearing here would mean it gets applied twice.
+    raw = base64.b64decode(b64.strip('"'))
+    assert base64.b64decode(fields[6]) == raw
+    assert base64.b64decode(fields[6]) != enc_agg_state(raw), "prefix must not be client-side"
 
 
 def test_tsv_row_escapes_a_dimension_containing_a_tab():
