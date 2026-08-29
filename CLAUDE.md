@@ -242,6 +242,26 @@ no re-hashing. Other `RowBinary` bits this depends on: `DateTime` = `<I` epoch s
   1000, and over a 50%-overlapping set yields 1500.
 - Full-datasource merge drifts 0.14% (users) / 1.63% (pages) — see the k cap below.
 
+**Cross-system dedup only holds for 64-bit argument types.** DataSketches widens every input
+to 64 bits before hashing — `update(int)` hashes an int64, `update(float)` hashes a double —
+while ClickHouse hashes the value at its declared storage width. Measured by comparing
+retained hash sets over the same 1000 values:
+
+| `AggregateFunction(uniqTheta, T)` | hashes match | migrated ∪ native (truth 1000) |
+| --- | --- | --- |
+| `String`, `LowCardinality(String)` | yes | 1000 |
+| `UInt64`, `Int64`, `Float64` | yes | 1000 |
+| `UInt32`, `Int32`, `UInt16`, `Float32` | **no, disjoint** | **2000** |
+
+**Declaring the column with a narrow numeric type silently double-counts.** Both states are
+the same aggregate type, so ClickHouse accepts the insert and the merge; the only symptom is
+a wrong number. The type system catches only the *cross-width* case — a `UInt32` state cannot
+be inserted into a `UInt64` column — which is no help when the column itself is narrow. So
+for a Druid Theta column over a numeric field, target `UInt64`/`Int64`/`Float64`, never a
+narrower type, whatever the values would fit in. `migrate_theta.py` targets `String` and is
+unaffected. Note also that `Nullable(String)` is a *different* aggregate type with an extra
+leading byte in its state, while `LowCardinality(String)` collapses to plain `String`.
+
 **ClickHouse `uniqTheta` has a hard-wired nominal k=4096** and no way to configure it (measured:
 retained entries settle around 4096–5724 and theta falls to 0.0116 at n=200k). Consequences:
 Druid's `size=16384` columns keep full precision *at rest* but are downsampled to k≈4096 on any

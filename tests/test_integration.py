@@ -310,6 +310,93 @@ def test_uniqtheta_state_is_a_bare_length_prefixed_sketch(ch_query):
         ch_query("DROP TABLE IF EXISTS _t_theta")
 
 
+# Cross-system Theta dedup depends on both sides hashing the same bytes. DataSketches widens
+# every input to 64 bits before hashing -- update(int) hashes an int64, update(float) hashes a
+# double -- while ClickHouse hashes the value at its declared storage width. They agree only
+# where that width is already 64 bits.
+THETA_SAFE_TYPES = [
+    ("String", "toString(number)", lambda i: str(i)),
+    ("UInt64", "toUInt64(number)", lambda i: i),
+    ("Int64", "toInt64(number)", lambda i: i),
+    ("Float64", "toFloat64(number)", lambda i: float(i)),
+]
+THETA_NARROW_TYPES = [
+    ("UInt32", "toUInt32(number)", lambda i: i),
+    ("Float32", "toFloat32(number)", lambda i: float(i)),
+]
+
+
+def _theta_merge_probe(ch_query, ch_type, expr, to_py, n=1000):
+    """Insert a migrated-style state and a natively-built one over the same n values,
+    then merge. Returns (migrated, native, merged)."""
+    sk = update_theta_sketch(14)
+    for i in range(n):
+        sk.update(to_py(i))
+
+    ch_query("DROP TABLE IF EXISTS _t_theta_types")
+    ch_query(f"CREATE TABLE _t_theta_types (lbl String, "
+             f"s AggregateFunction(uniqTheta, {ch_type})) ENGINE = MergeTree ORDER BY lbl")
+    ch_query("INSERT INTO _t_theta_types FORMAT RowBinary",
+             data=enc_string("migrated") + enc_agg_state(sk.compact().serialize()))
+    ch_query(f"INSERT INTO _t_theta_types SELECT 'native', uniqThetaState({expr}) "
+             f"FROM numbers({n})")
+    got = tuple(int(ch_query(
+        "SELECT uniqThetaMerge(s) FROM _t_theta_types" + w))
+        for w in (" WHERE lbl='migrated'", " WHERE lbl='native'", ""))
+    ch_query("DROP TABLE IF EXISTS _t_theta_types")
+    return got
+
+
+@pytest.mark.clickhouse
+@pytest.mark.parametrize("ch_type,expr,to_py", THETA_SAFE_TYPES,
+                         ids=[t[0] for t in THETA_SAFE_TYPES])
+def test_theta_dedup_holds_for_64_bit_types(ch_query, ch_type, expr, to_py):
+    """A migrated sketch and a native one over the same values must merge to one set.
+
+    Verified for every argument type where DataSketches and ClickHouse hash the same bytes.
+    String was the only one originally checked; these are the others that are safe.
+    """
+    migrated, native, merged = _theta_merge_probe(ch_query, ch_type, expr, to_py)
+    assert migrated == native == 1000
+    assert merged == 1000, f"{ch_type}: merged to {merged}, so the two sides disagree on hashing"
+
+
+@pytest.mark.clickhouse
+@pytest.mark.parametrize("ch_type,expr,to_py", THETA_NARROW_TYPES,
+                         ids=[t[0] for t in THETA_NARROW_TYPES])
+def test_theta_dedup_breaks_for_narrow_numeric_types(ch_query, ch_type, expr, to_py):
+    """Documents a silent failure by demonstrating it, as the HLL mixing test does.
+
+    Declaring the column with a sub-64-bit numeric type makes ClickHouse hash 4 bytes where
+    DataSketches hashed 8, so the two produce disjoint hash sets and a merge double-counts.
+    Nothing stops it: both states are the same aggregate type, so ClickHouse accepts the
+    insert and the merge, and the only symptom is a wrong number. The type system only
+    catches the *cross-width* case -- inserting a UInt32 state into a UInt64 column is
+    rejected -- which is no help when the column itself is the narrow one.
+
+    If this ever starts passing, the two have converged and the docs need revisiting.
+    """
+    migrated, native, merged = _theta_merge_probe(ch_query, ch_type, expr, to_py)
+    assert migrated == native == 1000
+    assert merged > 1.8 * 1000, (
+        f"{ch_type}: merged to {merged}; if this is now ~1000 the hashing has converged")
+
+
+@pytest.mark.clickhouse
+def test_theta_state_type_mismatch_is_rejected(ch_query):
+    """The one protection the type system does give: states of different argument types
+    cannot be mixed, so a UInt32-built state cannot leak into a UInt64 column."""
+    ch_query("DROP TABLE IF EXISTS _t_theta_width")
+    ch_query("CREATE TABLE _t_theta_width (s AggregateFunction(uniqTheta, UInt64)) "
+             "ENGINE = MergeTree ORDER BY tuple()")
+    try:
+        with pytest.raises(RuntimeError, match="Conversion from AggregateFunction"):
+            ch_query("INSERT INTO _t_theta_width "
+                     "SELECT uniqThetaState(toUInt32(number)) FROM numbers(10)")
+    finally:
+        ch_query("DROP TABLE IF EXISTS _t_theta_width")
+
+
 @pytest.mark.clickhouse
 def test_theta_dedupes_across_systems(ch_query):
     """Unlike HLL, a transcoded Theta sketch unions correctly with a native one."""
