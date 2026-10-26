@@ -5,9 +5,10 @@ Start them per CLAUDE.md:
     clickhouse server --config-file=clickhouse/config.xml
 
 These cover the claims the migrations rest on and that no offline test can reach:
-the uniqHLL12 format still matching this ClickHouse build, the DataSketches seed still
-matching across systems, and the two HLL merge behaviours (transplanted states union
-correctly with each other; mixing with native states double-counts).
+the uniqHLL12 and uniqCombined64 formats still matching this ClickHouse build, the
+DataSketches seed still matching across systems, and the two HLL merge behaviours for each
+transplant target (transplanted states union correctly with each other; mixing with native
+states double-counts).
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ import pytest
 import requests
 from datasketches import hll_sketch, hll_union, tgt_hll_type, update_theta_sketch
 
+import uniqcombined64 as uc64
 from sketch_io import decode_druid_sketch, enc_agg_state, enc_string
 from uniqhll12 import LG_K, decode_registers, encode_state, state_from_datasketches
 
@@ -237,6 +239,98 @@ def test_transplanted_and_native_states_must_not_be_mixed(ch_query):
             "re-check docs/hll-sketch-formats.md before relying on this")
     finally:
         ch_query("DROP TABLE IF EXISTS _t_mix")
+
+
+# ------------------------------------------------------------- uniqCombined64(K) target
+def uc64_state(ch_query, k, n, arg="number"):
+    return bytes.fromhex(ch_query(
+        f"SELECT hex(toString(uniqCombined64State({k})({arg}))) FROM numbers({n})"))
+
+
+@pytest.mark.clickhouse
+@pytest.mark.parametrize("k,n,arg", [
+    (12, 5000, "number"), (14, 100000, "number"), (14, 100000, "toString(number)"),
+    (16, 100000, "number"), (17, 1000000, "number"), (20, 2000000, "number"),
+])
+def test_uniqcombined64_format_still_matches_this_build(ch_query, k, n, arg):
+    """The regression gate for uniqcombined64.py. K=16 is where the zero counter widens."""
+    produced = uc64_state(ch_query, k, n, arg)
+    assert uc64.encode_state(uc64.decode_registers(produced, k), k) == produced
+
+
+@pytest.mark.clickhouse
+@pytest.mark.parametrize("k", [12, 14])
+def test_uniqcombined64_tier_boundaries(ch_query, k):
+    """SMALL to 16 values, MEDIUM to 2^(K-5), then LARGE. Transplants always write LARGE, so
+    this matters only as a check that the container-type byte still means what it did."""
+    medium_max = 1 << (k - 5)
+    for n, want in ((16, uc64.SMALL), (17, uc64.MEDIUM), (medium_max, uc64.MEDIUM),
+                    (medium_max + 1, uc64.LARGE)):
+        assert uc64_state(ch_query, k, n)[0] == want, f"K={k} n={n}"
+
+
+@pytest.mark.clickhouse
+@pytest.mark.parametrize("k,arg,hashes", [
+    (12, "number", lambda ch_query, n: [uc64.int_hash64(i) for i in range(n)]),
+    (14, "toString(number)", lambda ch_query, n: [
+        int(h) for h in ch_query(f"SELECT cityHash64(toString(number)) FROM numbers({n})").split()]),
+], ids=["int_hash64", "cityHash64"])
+def test_uniqcombined64_hash_model(ch_query, k, arg, hashes):
+    """Registers recomputed from the hash values match ClickHouse's. Integers use the
+    unsalted C++ intHash64, not the SQL function of that name."""
+    n = 50000
+    assert uc64.native_registers(hashes(ch_query, n), k) == \
+        uc64.decode_registers(uc64_state(ch_query, k, n, arg), k)
+
+
+@pytest.mark.clickhouse
+@pytest.mark.parametrize("k", [12, 14, 17])
+def test_uniqcombined64_transplant_is_readable_by_clickhouse(ch_query, k):
+    t = f"_t_uc64_read_{k}"
+    ch_query(f"DROP TABLE IF EXISTS {t}")
+    ch_query(f"CREATE TABLE {t} (label String, s AggregateFunction(uniqCombined64({k}), String)) "
+             "ENGINE = MergeTree ORDER BY label")
+    try:
+        for n in (20, 10000, 200000):
+            s = hll((f"v{i}" for i in range(n)), lg_k=k)
+            ch_query(f"INSERT INTO {t} FORMAT RowBinary", data=enc_string(f"n{n}")
+                     + uc64.state_from_datasketches(s.serialize_compact(), k))
+            got = float(ch_query(f"SELECT uniqCombined64Merge({k})(s) FROM {t} "
+                                 f"WHERE label = 'n{n}'"))
+            assert abs(got - s.get_estimate()) / s.get_estimate() < 0.06, f"K={k} n={n}"
+    finally:
+        ch_query(f"DROP TABLE IF EXISTS {t}")
+
+
+@pytest.mark.clickhouse
+def test_uniqcombined64_transplants_union_but_must_not_mix_with_native(ch_query):
+    """Both HLL merge behaviours at K=14, the precision uniqHLL12 cannot hold. As with
+    uniqHLL12, the double-count must *stay* broken; if it heals, the hashes have converged."""
+    k = 14
+    ch_query("DROP TABLE IF EXISTS _t_uc64_merge")
+    ch_query("CREATE TABLE _t_uc64_merge (label String, "
+             f"s AggregateFunction(uniqCombined64({k}), String)) ENGINE = MergeTree ORDER BY label")
+    try:
+        a = hll((f"k{i}" for i in range(1000)), lg_k=k)
+        b = hll((f"k{i}" for i in range(500, 1500)), lg_k=k)
+        for label, sk in (("a", a), ("b", b), ("a_dup", a)):
+            ch_query("INSERT INTO _t_uc64_merge FORMAT RowBinary",
+                     data=enc_string(label) + uc64.state_from_datasketches(sk.serialize_compact(), k))
+        ch_query(f"INSERT INTO _t_uc64_merge SELECT 'native', "
+                 f"uniqCombined64State({k})(concat('k', toString(number))) FROM numbers(1000)")
+
+        def merged(labels):
+            return int(ch_query(f"SELECT uniqCombined64Merge({k})(s) FROM _t_uc64_merge "
+                                f"WHERE label IN ({labels})"))
+
+        ab = merged("'a','b'")
+        assert abs(ab - 1500) / 1500 < 0.05
+        assert merged("'a','b','a_dup'") == ab, "re-adding an identical sketch must not inflate"
+        assert abs(merged("'native'") - 1000) / 1000 < 0.05
+        assert merged("'a','native'") > 1.8 * 1000, (
+            "identical inputs merged to ~1x, so the hashes now agree -- revisit the docs")
+    finally:
+        ch_query("DROP TABLE IF EXISTS _t_uc64_merge")
 
 
 @pytest.mark.clickhouse

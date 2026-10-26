@@ -34,24 +34,26 @@ picking one.
 
 ```bash
 .venv/bin/pytest                      # everything; integration tests self-skip if servers are down
-.venv/bin/pytest -m "not integration" # offline only, ~0.3 s
+.venv/bin/pytest -m "not integration" # offline only, ~0.5 s
 .venv/bin/pytest -m clickhouse        # one system's integration tests
 .venv/bin/pytest tests/test_uniqhll12.py -k clamp   # single file / single test
 ```
 
 The suite splits along one line: **offline tests need nothing running**, and cover the fragile
-pure logic — the reverse-engineered `uniqhll12.py` codec and the RowBinary encoders in
-`sketch_io.py`. **Integration tests** are marked `druid` / `clickhouse` (plus an umbrella
+pure logic — the two ClickHouse HLL codecs (`uniqhll12.py`, `uniqcombined64.py`) and the
+RowBinary encoders in `sketch_io.py`. **Integration tests** are marked `druid` / `clickhouse` (plus an umbrella
 `integration`) and *skip themselves* when their server is unreachable, so a bare `pytest` run
 always works. `conftest.py` probes reachability once per session and caches it; the Druid probe
 also requires the fixture datasource to exist, so a bare Druid does not produce failures that
 have nothing to do with the code.
 
-Integration tests own the claims no offline test can reach: that the `uniqHLL12` state format
-still matches this ClickHouse build (byte-exact round-trip of states ClickHouse produced), that
-the DataSketches seed hash still matches across systems, and the two HLL merge behaviours.
-`test_transplanted_and_native_states_must_not_be_mixed` asserts the breakage *stays* broken — if
-it ever starts passing, the hashes have converged and the docs need revisiting.
+Integration tests own the claims no offline test can reach: that the `uniqHLL12` and
+`uniqCombined64` state formats still match this ClickHouse build (byte-exact round-trip of
+states ClickHouse produced), that the DataSketches seed hash still matches across systems, and
+the two HLL merge behaviours for each transplant target.
+`test_transplanted_and_native_states_must_not_be_mixed` and
+`test_uniqcombined64_transplants_union_but_must_not_mix_with_native` assert the breakage *stays*
+broken — if either ever starts passing, the hashes have converged and the docs need revisiting.
 
 These do not replace the `verify()` functions in the migration scripts, which check a full
 end-to-end migration against live data. The suite pins the units those scripts are built from.
@@ -102,8 +104,10 @@ Then any of the migrations (each migrates and self-verifies, ending in `ALL CHEC
 .venv/bin/python migrate_theta.py --format tsv   # same, via base64 text + CAST
 .venv/bin/python migrate_hll.py             # HLL  -> pre-merged estimates + carried bytes
 .venv/bin/python migrate_hll_transplant.py  # HLL  -> native uniqHLL12 states
+.venv/bin/python migrate_hll_transplant.py --target uniqcombined64   # HLL -> uniqCombined64(lgK)
 .venv/bin/python migrate_quantiles.py       # quantiles -> carried bytes + native t-digest
-.venv/bin/python spikes/reverse_uniqhll12.py   # re-validate the uniqHLL12 format
+.venv/bin/python spikes/reverse_uniqhll12.py        # re-validate the uniqHLL12 format
+.venv/bin/python spikes/reverse_uniqcombined64.py   # re-validate uniqCombined64 + accuracy
 ```
 
 Each migration recreates its target table, so all are safe to re-run.
@@ -124,9 +128,10 @@ so the two families can be compared directly.
 ## Current state
 
 Four working migration paths, each a self-verifying script at the repo root:
-`migrate_theta.py`, `migrate_hll.py`, `migrate_hll_transplant.py`, `migrate_quantiles.py`. Shared plumbing lives in
-`sketch_io.py` (Druid reads, ClickHouse writes, RowBinary encoders) and `uniqhll12.py` (the
-reverse-engineered ClickHouse HLL codec). `spikes/` holds the investigations that produced the
+`migrate_theta.py`, `migrate_hll.py`, `migrate_hll_transplant.py` (two targets, `--target
+uniqhll12|uniqcombined64`), `migrate_quantiles.py`. Shared plumbing lives in `sketch_io.py`
+(Druid reads, ClickHouse writes, RowBinary encoders) and the two ClickHouse HLL codecs:
+`uniqhll12.py` (reverse-engineered) and `uniqcombined64.py` (read from ClickHouse source). `spikes/` holds the investigations that produced the
 format findings; `druid/` and `clickhouse/` hold fixture config.
 
 Still undecided (do not assume): whether this ships as a library or a CLI — the scripts are
@@ -144,7 +149,7 @@ keep the two in sync when adding a key.
 | Druid | `$DRUID_HOME` = `/Users/hellmarbecker/apache-druid-37.0.0` (v37.0.0) |
 | Druid sketch extension | `$DRUID_HOME/extensions/druid-datasketches/druid-datasketches-37.0.0.jar` |
 | **Sketch binary format producer** | `$DRUID_HOME/lib/datasketches-java-4.2.0.jar` (+ `datasketches-memory-2.2.0.jar`) |
-| ClickHouse | `/Users/hellmarbecker/.local/bin/clickhouse`, v26.8.1.120 |
+| ClickHouse | `/Users/hellmarbecker/.local/bin/clickhouse`, v26.10.1.288 (a symlink into `~/.clickhouse/versions/`; 26.8.1.120 is still installed alongside) |
 | Java | OpenJDK 21.0.7 (Homebrew) |
 
 `datasketches-java` **4.2.0** wrote the sketch bytes in Druid; the Python `datasketches` 5.2.0
@@ -153,6 +158,18 @@ Druid's own `HLL_SKETCH_ESTIMATE`/`THETA_SKETCH_ESTIMATE` for the same sketch an
 within 1e-6 on every column. Cross-language binary compatibility is settled; don't re-litigate it.
 
 Use `clickhouse local` to probe ClickHouse functions and formats without running a server.
+
+**Version history.** Everything below was first derived on ClickHouse **26.8.1.120**. The
+binary was upgraded to **26.10.1.288** on 2026-09-20, without these notes being updated at the
+time. On 2026-10-26 the following were rerun on 26.10.1.288 and all pass:
+every migration's `verify()` (Theta in both wire formats, HLL, both transplant targets,
+quantiles), `spikes/inspect_sketches.py` (seed hash 37836 both sides),
+`spikes/reverse_uniqhll12.py`, and the full test suite. Figures quoted below match to within
+a few hundredths of a percent; where they moved, the 26.10 value is given. **Not rerun:**
+`clickhouse/migrate-sketches-sqlonly.sql` and the nginx shim. Where a section says "measured on
+26.8.1.120", that is where it was found, not the last build it was checked on. When upgrading,
+check what `which clickhouse` resolves to: the symlink moves, and a server already running keeps
+the old version until restarted.
 
 ## Reading sketches out of Druid
 
@@ -175,13 +192,17 @@ What the bytes tell you, measured on the fixture:
 
 ## The core architectural constraint
 
-Verified against the installed ClickHouse 26.8.1.120:
+Verified against ClickHouse 26.8.1.120:
 
 ```
 SELECT name FROM system.functions
 WHERE name ILIKE '%theta%' OR name ILIKE '%hll%' OR name ILIKE '%sketch%'
 -- uniqHLL12, uniqTheta, uniqThetaIntersect, uniqThetaNot, uniqThetaUnion
 ```
+
+That query misses one HLL family by name: **`uniqCombined` / `uniqCombined64` are HLL too**,
+with configurable precision. It's the better transplant target when a column's lgK isn't 12 —
+see the uniqCombined64 section below.
 
 **Theta and HLL are not symmetric problems. Treat them as two separate workstreams.**
 
@@ -284,7 +305,8 @@ cross-row merge, so expect ~1.6% RSE instead of ~0.8%. Building a Theta column i
 
 `docs/hll-sketch-formats.md` — both HLL binary formats field by field, a side-by-side comparison,
 and the argument for why transplanted sketches merge with each other but not with native
-ClickHouse ones. Read it before touching `uniqhll12.py` or either HLL migration.
+ClickHouse ones. Read it before touching `uniqhll12.py`, `uniqcombined64.py` or either HLL
+migration.
 
 `clickhouse/migrate-sketches-sqlonly.sql` — all three migrations expressed as ClickHouse SQL,
 with no Python touching the sketch bytes. Every state it produces is byte-identical to the
@@ -318,7 +340,14 @@ unverified.
 
 Codec in `uniqhll12.py`; evidence and re-validation in `spikes/reverse_uniqhll12.py`. **This
 format is undocumented and version-specific — re-run that spike after any ClickHouse upgrade
-before trusting `migrate_hll_transplant.py`.** Derived against 26.8.1.120.
+before trusting `migrate_hll_transplant.py`.** Derived against 26.8.1.120, re-validated on
+26.10.1.288.
+
+ClickHouse source has since confirmed the inferences: `uniqHLL12` is
+`HyperLogLogCounter<12, …, UInt32>`, the same class as `uniqCombined64`'s HLL tier but with a
+32-bit hash. Bucket = low 12 bits; rank = **trailing** zeros of the 20-bit tail + 1. The
+estimator is the same one `uniqCombined64(12)` uses, which is why both give identical numbers
+on transplanted lgK=12 registers.
 
 Dense ("large") form, a fixed **2651 bytes** at any cardinality:
 
@@ -349,7 +378,10 @@ Validation is that round-trip, at every cardinality from 17 to 1e6.
 
 ## HLL transplant path (working — `migrate_hll_transplant.py`)
 
-Druid HLL → `AggregateFunction(uniqHLL12, String)`, queryable with plain `uniqHLL12Merge`.
+Two targets behind `--target`. The default, described here, is Druid HLL →
+`AggregateFunction(uniqHLL12, String)` into `wikipedia_rollup_hll_native`, queryable with plain
+`uniqHLL12Merge`. `--target uniqcombined64` keeps each column's lgK instead — next section.
+Both share `migrate()` and `verify()`; the differences live in one `Target` record per target.
 Registers are folded to lgK=12 via `hll_union`, extracted from either the dense array at byte 40
 or the sparse coupon list, then packed. A manual fold — max over registers sharing the low lgK
 bits — is also valid here and is what the SQL-only path uses; DataSketches takes the rank from a
@@ -358,7 +390,7 @@ in Python regardless: correct by construction, and representation-agnostic.
 
 **Verified:**
 
-- Native `uniqHLL12Merge` across all 2486 rows tracks Druid: 3.49% (users), 0.61% (pages).
+- Native `uniqHLL12Merge` across all 2486 rows tracks Druid: 3.46% (users), 0.59% (pages).
   Per-channel merges land 0.25%–1.31%.
 - Transplanted states **union correctly with each other**: A∪B = 1509 against a truth of 1500
   and a DataSketches union of 1508, and re-adding A leaves it unchanged.
@@ -371,11 +403,70 @@ historical number in the column. `verify()` demonstrates the breakage rather tha
 the rule.
 
 **Choosing between this and `migrate_hll.py`:** transplant gives native in-engine merging and no
-external process, but estimates drift ~1–3% from source because ClickHouse applies its own bias
-correction to the same registers. The pre-merge + UDF path reproduces source values exactly and
+external process, but estimates drift ~1–4% from source because ClickHouse applies its own
+estimator to the same registers. The pre-merge + UDF path reproduces source values exactly and
 is mergeable with anything, but needs a UDF process and pre-materialised grains. Also note the
 lgK=14 `pages` column is folded to 12 here, halving its precision (~0.81% → ~1.63% RSE);
-`migrate_hll.py` preserves lgK=14.
+`migrate_hll.py` and `--target uniqcombined64` both preserve lgK=14.
+
+**The `users` drift is systematic, not noise — and neither target fixes it.** In 40 trials at
+the column's cardinality (n=10531 at lgK=12, i.e. 2.57 × 2¹²), both ClickHouse estimates
+overcount by **+2.22% on average** (RMSE 2.61%), while DataSketches over the same registers
+averages +0.12%. The cause is in ClickHouse's estimator: it uses linear counting up to
+2.5 × 2^K, then the raw HLL formula, which runs high just past that switch. The HLL++
+empirical bias table that would correct this exists only for **K=17**
+(`UniqCombinedBiasData`, gated on `K == 17` in `AggregateFunctionUniqCombined.h`; source
+comments say the generator script for other K no longer works). Measured across K at
+n = 2.75 × 2^K: +1.54% (K=15), +1.49% (16), **−0.01% (17)**, +1.61% (18). A lgK=12 source
+cannot reach K=17, because registers cannot be unfolded. So lgK=12 columns carry this bias
+under either target; only `migrate_hll.py` avoids it.
+
+## uniqCombined64 transplant target (working — `migrate_hll_transplant.py --target uniqcombined64`)
+
+Druid HLL → `AggregateFunction(uniqCombined64(K), String)` into `wikipedia_rollup_hll_uc64`,
+with **K = the column's own lgK** (read from the first row's preamble), clamped to
+ClickHouse's 12–20. The fixture lands as `users` K=12 and `pages` K=14. Query with
+`uniqCombined64Merge(K)(col)` — the K must match the column's type. Codec in `uniqcombined64.py`;
+evidence in `spikes/reverse_uniqcombined64.py`, which also measures accuracy against the raw
+file. Re-run that spike after any ClickHouse upgrade.
+
+**Read from source, not reverse-engineered.** The layout comes from `CombinedCardinalityEstimator.h`,
+`HyperLogLogCounter.h` and `CompactArray.h` (identical in v26.8.1.2041-lts and v26.10.1.1-new),
+then confirmed by byte-exact round-trip of ClickHouse's own states at K=12/14/16/17/20. LARGE form:
+
+| size | meaning |
+| --- | --- |
+| 1 | container type: 1 = SMALL, 2 = MEDIUM, **3 = LARGE** |
+| 2^K × 6 / 8 | registers, **6 bits** each, LSB-first, register *k* at bits `[6k, 6k+6)` |
+| 4 × (66 − K) | `UInt32` histogram of register values, rank 0..65−K |
+| 2 or 4 | zero-register count — `UInt16` below K=16, **`UInt32` from K=16** |
+
+Sizes: 3291 B at K=12, 12499 at K=14, 98505 at K=17, 786621 at K=20. SMALL (≤16 values) and
+MEDIUM (≤ 2^(K−5)) hold exact ClickHouse hashes and are unwritable, as with `uniqHLL12`'s sparse
+form — always emit LARGE. Each K is a distinct aggregate type: K=12 and K=14 states cannot be
+merged with each other, nor with `uniqCombined` (the 32-bit variant, which has 5-bit registers
+for non-String arguments — the docs' "6 bits each" is wrong for it).
+
+**Verified:**
+
+- `pages` without the fold, over 40 trials at n=35143: **RMSE 0.92% vs 1.59%** for the folded
+  `uniqHLL12` transplant (DataSketches: 0.50%). On the fixture itself the single draw went the
+  other way (+1.31% vs +0.71% against the exact count) — 1.4σ, which is why the spike runs trials.
+- `users` lands identically to the `uniqHLL12` target (10931 both), as the shared estimator predicts.
+- Transplanted states union with each other (A∪B = 1492 vs a true 1500 at K=14) and
+  **double-count against native ones** (same 1000 values → 2012). The `uniqHLL12` rule carries
+  over unchanged: nothing may ever write these columns with `uniqCombined64State()`.
+
+**Trap: SQL `intHash64` is not the hash `uniqCombined64` uses.** The SQL function computes
+`intHash64(x ^ 0x4CF2D2BAAE6DA887)`; the aggregate applies the bare MurmurHash3 finalizer, so it
+maps 0 to 0 (that's why bucket 0 of a native state over `numbers(n)` holds the maximum rank).
+Strings use CityHash64, which SQL `cityHash64` does match. `uniqcombined64.int_hash64` is the
+port, pinned by tests. Only matters for proving the hash model — a transplant never hashes.
+
+**Choosing between the two transplant targets:** use `uniqcombined64` for any column with
+lgK > 12 — it keeps the source precision at no cost. At lgK=12 the two are equivalent in
+accuracy; `uniqcombined64` states are 24% larger (3291 vs 2651 B), and `uniqHLL12` has the
+longer track record here (incremental-MV test, SQL-only path).
 
 ## Quantiles path (working — `migrate_quantiles.py`)
 
@@ -441,7 +532,8 @@ Verified sketch layouts (all reproducible with the probes below):
 | DataSketches HLL_8, lgK=12 | 4136 B | 40 B preamble + **4096 one-byte registers** |
 | DataSketches HLL_6, lgK=12 | 3113 B | 40 B preamble + 4096×6 bits |
 | DataSketches HLL_4, lgK=12 | 2216 B | 40 B preamble + 4096×4 bits + 128 B exceptions table |
-| ClickHouse `uniqHLL12` | 2651 B | 2 B varint length + 1 B large-flag + **2648 B opaque packed** |
+| ClickHouse `uniqHLL12` | 2651 B | 1 B large-flag + 4096×5 bits + 22×`UInt32` histogram + `UInt16` zeros |
+| ClickHouse `uniqCombined64(K)` | 3291 B at K=12 | 1 B container type + 2^K×6 bits + (66−K)×`UInt32` histogram + zeros |
 
 DataSketches preamble bytes: `serVer=1`, `familyId=7`, byte 3 = `lgK`, last header byte encodes
 mode + target type. Below roughly 100–200 distinct values the sketch is in **LIST/SET (coupon)
@@ -464,12 +556,13 @@ are built and verified in `migrate_hll.py` — see the section after this one.**
    ClickHouse has no user-defined *aggregate* functions, so merging is
    `groupArray(sketch)` → executable UDF that unions via DataSketches. Slower and memory-hungry
    for wide groups, but correct. Good as a companion to option 1 rather than a replacement.
-3. **Register transplant into `uniqHLL12` — no longer blocked; built in
-   `migrate_hll_transplant.py`.** The state format was reverse-engineered (see below). HLL's
+3. **Register transplant into `uniqHLL12` or `uniqCombined64(K)` — built in
+   `migrate_hll_transplant.py` (`--target`).** Both state formats are decoded (see below). HLL's
    estimator is symmetric in its buckets, so copying a register array preserves the cardinality
-   estimate even though the hash functions differ. Gives native `uniqHLL12Merge` in plain SQL
-   with no UDF, at the cost of ~1–3% estimate drift and one hard rule: transplanted states must
-   never be merged with natively-built ones.
+   estimate even though the hash functions differ. Gives native `-Merge` in plain SQL with no
+   UDF, at the cost of ~1–4% estimate drift (systematic at lgK=12, see the transplant section)
+   and one hard rule: transplanted states must never be merged with natively-built ones.
+   `uniqCombined64` keeps lgK 12–20 unfolded; `uniqHLL12` folds everything to 12.
 4. **Refilling a `uniqHLL12` state with synthetic keys is an anti-pattern.** It yields a state
    that estimates ≈N and merges *mechanically*, but synthetic keys never collide, so unions
    return `N1+N2` and silently lose all overlap detection. Only defensible when the grains are
