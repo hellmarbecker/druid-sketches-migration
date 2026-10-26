@@ -4,7 +4,7 @@
 
 If you run Apache Druid with rollup, some of your most valuable columns are probably sketches. A rollup table discards the raw events at ingestion time. What's left of "how many distinct users did we see per hour and channel" is a sketch column. If you migrate to ClickHouse, you can't re-ingest those events, because they no longer exist. The sketches have to come across as they are.
 
-This post walks through the whole problem: what the sketches are, how both engines keep aggregation state, and the two very different stories for theta and HLL. All the findings come from a working migration toolkit, with tests, verified against Druid 37 and ClickHouse 26.8: [github.com/hellmarbecker/druid-sketches-migration](https://github.com/hellmarbecker/druid-sketches-migration).
+This post walks through the whole problem: what the sketches are, how both engines keep aggregation state, and the two very different stories for theta and HLL. All the findings come from a working migration toolkit, with tests, verified against Druid 37 and ClickHouse 26.8, and re-validated on 26.10: [github.com/hellmarbecker/druid-sketches-migration](https://github.com/hellmarbecker/druid-sketches-migration).
 
 ---
 
@@ -14,9 +14,9 @@ A few terms come up again and again, so here they are up front.
 
 **HLL terms**
 
-- **lgK**: log2 of the number of buckets K. lgK = 12 means 4096 registers. A higher lgK means more accuracy (error ≈ 1.04/√K) and more memory. Druid lets you choose 4–21 per column; ClickHouse fixes it at 12.
-- **Register**: one small counter per bucket. It holds the highest rank seen for any value that hashed into that bucket. The full array of registers is the dense sketch. Druid stores registers 4, 6 or 8 bits wide; ClickHouse uses 5 bits.
-- **Rank**: the number of leading zeros in a value's hash bits, plus one. A rank of *r* turns up with probability 2⁻ʳ, so high ranks are evidence of many distinct values. Druid allows ranks up to about 63; ClickHouse caps them at 21.
+- **lgK**: log2 of the number of buckets K. lgK = 12 means 4096 registers. A higher lgK means more accuracy (error ≈ 1.04/√K) and more memory. Druid lets you choose 4–21 per column. In ClickHouse, `uniqHLL12` fixes it at 12, while `uniqCombined64` lets you choose 12–20.
+- **Register**: one small counter per bucket. It holds the highest rank seen for any value that hashed into that bucket. The full array of registers is the dense sketch. Druid stores registers 4, 6 or 8 bits wide. ClickHouse uses 5 bits in `uniqHLL12` and 6 bits in `uniqCombined64`.
+- **Rank**: the number of leading zeros in a value's hash bits, plus one. (ClickHouse counts trailing zeros instead, which is statistically the same thing.) A rank of *r* turns up with probability 2⁻ʳ, so high ranks are evidence of many distinct values. Druid allows ranks up to about 63. ClickHouse caps them at 21 in `uniqHLL12`, and at 65 − lgK in `uniqCombined64`.
 - **Slot**: the hash bits that pick a value's bucket. In a Druid coupon it is a 26-bit field, and the register index is its low lgK bits, `slot & (2^lgK − 1)`. That's why an lgK 14 sketch can be folded down to lgK 12.
 - **Coupon**: Druid's sparse-mode entry. One `UInt32` packs the slot (bits 0–25) and the rank (bits 26–31). Small sketches store a list of coupons instead of a full register array. A coupon is not a raw hash, so the original keys can't be recovered from it.
 
@@ -108,7 +108,7 @@ This works because a given key always lands in the same bucket with the same ran
 - **Order doesn't matter.** max is commutative and associative, so rows can roll up in any order or grouping.
 - **Preconditions:** both sides must use the same hash function and seed, and the same lgK. A sketch with a larger lgK can be folded down first.
 
-In SQL this is `DS_HLL(col)` in Druid and `uniqHLL12Merge(state)` in ClickHouse.
+In SQL this is `DS_HLL(col)` in Druid, and `uniqHLL12Merge(state)` or `uniqCombined64Merge(lgK)(state)` in ClickHouse.
 
 Keep that "same hash function" precondition in mind. It's the source of the biggest trap in this whole migration.
 
@@ -244,7 +244,7 @@ Reading from Druid needs a small helper. Druid's SQL endpoint only accepts POST,
 
 ## 4. Anatomy of an HLL sketch
 
-Theta was easy because both engines speak DataSketches. For HLL they don't. ClickHouse's only HLL function, `uniqHLL12`, is its own implementation. To see what that means, we need to look at both formats byte by byte.
+Theta was easy because both engines speak DataSketches. For HLL they don't. ClickHouse has two HLL functions, `uniqHLL12` and `uniqCombined64`, and both are its own implementation. (`uniqCombined64` is easy to miss: its name doesn't say HLL.) To see what that means, we need to look at both formats byte by byte.
 
 ### The different formats in Druid
 
@@ -297,6 +297,21 @@ The sparse ("small") form, used for up to 16 values, stores raw `UInt64` ClickHo
 | Rank ceiling | ~63 | 21 |
 | Format contract | documented, versioned | internal, no guarantee |
 
+#### The other ClickHouse HLL: `uniqCombined64`
+
+`uniqCombined64(lgK)` takes the precision as a parameter, from 12 to 20. Its state starts with a type byte for one of three tiers: a small array of exact hashes, then a hash set, then a real HLL. Only the HLL tier can be written from a DataSketches sketch, for the same reason as `uniqHLL12`'s sparse form. That tier is the `uniqHLL12` layout scaled up:
+
+```
+┌──────────┬──────────────────────────────────┬────────────────────────┬────────────────┐
+│ type = 3 │ K registers × 6 bits,            │ histogram              │ zero count     │
+│ 1 B      │ LSB-first                        │ (66 − lgK) × UInt32    │ UInt16/UInt32  │
+└──────────┴──────────────────────────────────┴────────────────────────┴────────────────┘
+```
+
+That's 3291 bytes at lgK 12 and 12499 at lgK 14. Each precision is a separate aggregate type, so states with different lgK can't be merged with each other. This layout was read from the ClickHouse source rather than reverse-engineered, then checked with the same byte-exact round-trip.
+
+The big win is that it can hold an lgK 14 column without folding it.
+
 #### Buckets and coupons
 
 A Druid coupon is a single `UInt32`:
@@ -315,7 +330,7 @@ ClickHouse packs its registers into 5-bit fields, LSB-first, so registers stradd
 This is the deepest difference, and the one that can't be bridged.
 
 - **DataSketches** hashes with 128-bit MurmurHash3, seed 9001. One 64-bit lane supplies the slot; the other supplies the rank (leading zeros + 1). Slot and rank are therefore independent, and ranks can go up to about 63. That independence is also why folding lgK 14 down to 12 is just a max over registers that share their low bits.
-- **ClickHouse** uses its own 32-bit hash: 12 bits for the bucket, leaving a 20-bit tail for the rank, which caps it at 21. (That's inferred from the format, not read from the source.)
+- **ClickHouse** uses its own hash. In `uniqHLL12` it's 32 bits: the low 12 bits pick the bucket, leaving a 20-bit tail for the rank, which caps it at 21. `uniqCombined64` uses a 64-bit hash, so its ranks go up to 65 − lgK. In both, the rank is the trailing zeros of the tail plus one.
 
 Neither HLL format carries a seed hash. Unlike theta, there is nothing in the bytes that would even tell you the two systems disagree.
 
@@ -346,7 +361,7 @@ One trap when validating: Druid's `APPROX_COUNT_DISTINCT_DS_HLL` merges at lgK 1
 
 ### Exporting aggregation state
 
-If you want native `uniqHLL12Merge` in plain SQL, you can build real ClickHouse states from Druid's registers.
+If you want native merging in plain SQL, you can build real ClickHouse states from Druid's registers. There are two targets: `uniqHLL12`, which needs every column folded to lgK 12, and `uniqCombined64(lgK)`, which keeps the column's own lgK. The steps below are for `uniqHLL12`; for `uniqCombined64` you skip the fold, clamp at 65 − lgK, and pack 6-bit registers.
 
 #### How to map the coupons and buckets
 
@@ -377,11 +392,25 @@ arrayReduce('maxMap',
 
 The SQL version handles sparse input only, so run the guard query first. It also has to be chunked (about 96 rows per run); otherwise ClickHouse tries to allocate 24 GiB broadcasting the register array.
 
-How well does it work? Native `uniqHLL12Merge` across all rows lands within 3.49% (users) and 0.61% (pages) of Druid. The residual comes from ClickHouse applying its own bias correction to the same registers. Folding the lgK 14 column to 12 halves its precision, from about 0.81% to about 1.63% relative standard error. And because the format is reverse-engineered, re-validate it after every ClickHouse upgrade.
+How well does it work? Native `uniqHLL12Merge` across all rows lands within 3.46% (users) and 0.59% (pages) of Druid.
+
+The users gap isn't random noise. ClickHouse estimates small cardinalities with linear counting, then switches to the raw HLL formula at 2.5 × K. Just past that switch the raw formula runs high. HLL++ fixes this with a table of empirical bias corrections, but ClickHouse only ships that table for lgK 17. With about 10,500 distinct users in 4096 buckets, the users column sits at 2.57 × K. Over 40 trials at that cardinality, ClickHouse overcounted by 2.22% on average, while DataSketches averaged +0.12% over exactly the same registers. An lgK 12 column can't be raised to lgK 17, so neither target fixes this.
+
+Precision is where the two targets differ. Folding the lgK 14 pages column to 12 for `uniqHLL12` halves its precision. `uniqCombined64(14)` keeps all 16384 registers. Over 40 trials at the pages cardinality, measured against the exact count:
+
+| | RMSE |
+|---|---|
+| DataSketches (source) | 0.50% |
+| `uniqCombined64(14)`, unfolded | 0.92% |
+| `uniqHLL12`, folded to 12 | 1.59% |
+
+The test fixture on its own pointed the other way: +1.31% for `uniqCombined64` against +0.71% for `uniqHLL12`, both compared with the exact count. That single draw was about 1.4 standard deviations out, which is why one dataset isn't enough to compare estimators.
+
+Both formats are internal to ClickHouse, so re-validate them after every upgrade.
 
 #### Caveat: you can never merge with ClickHouse native data
 
-Transplanted states and states built natively with `uniqHLL12State()` have the same type, so ClickHouse will happily merge them. The result is wrong, and nothing warns you. Measured on the same 1000 values:
+Transplanted states and states built natively with `uniqHLL12State()` have the same type, so ClickHouse will happily merge them. The same goes for `uniqCombined64`. The result is wrong, and nothing warns you. Measured on the same 1000 values:
 
 | | estimate |
 |---|---|
@@ -407,7 +436,7 @@ That also explains why the transplant works at all. The HLL estimate depends onl
 
 Theta escapes all of this because it stores the hashes, and both sides use the same hash. HLL threw them away.
 
-The practical rule: **nothing may ever write a transplanted column with `uniqHLL12State()`.** A single native insert corrupts every historical number in that column, with no error and no way to tell afterwards which rows came from where. If a column has to accept native writes, use the finalized-values path instead.
+The practical rule: **nothing may ever write a transplanted column with `uniqHLL12State()` or `uniqCombined64State()`.** For `uniqCombined64` we measured the same thing: 1000 shared values merged to 2012. A single native insert corrupts every historical number in that column, with no error and no way to tell afterwards which rows came from where. If a column has to accept native writes, use the finalized-values path instead.
 
 ---
 
@@ -417,6 +446,6 @@ Choose the path by what the column has to do after migration.
 
 1. **Theta → `uniqTheta`.** Lossless: add a LEB128 header and you're done. The result merges correctly with native ClickHouse data. Use 64-bit or `String` argument types. Wherever you can still rebuild a column, prefer theta.
 2. **HLL → finalized values.** Exact Druid numbers at every grain you pre-merge, mergeable with anything, optionally backed by the raw bytes and a UDF.
-3. **HLL → transplant.** Native `uniqHLL12Merge` in plain SQL, at the cost of ~1–3% drift and lgK folded to 12. Never mix with native states, and re-validate after every upgrade.
+3. **HLL → transplant.** Native merging in plain SQL. Use `uniqCombined64(lgK)` to keep the column's own lgK, or `uniqHLL12` if everything is lgK 12 anyway. Expect ~1–4% drift; at lgK 12 part of it is a systematic overcount by ClickHouse's estimator. Never mix with native states, and re-validate after every upgrade.
 
 Code, tests and the full format notes are in the repository: [github.com/hellmarbecker/druid-sketches-migration](https://github.com/hellmarbecker/druid-sketches-migration).
