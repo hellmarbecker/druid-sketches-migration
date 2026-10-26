@@ -1,4 +1,4 @@
-# HLL sketch formats: Apache DataSketches (Druid) vs ClickHouse `uniqHLL12`
+# HLL sketch formats: Apache DataSketches (Druid) vs ClickHouse `uniqHLL12` / `uniqCombined64`
 
 Reference for the HLL side of the migration. Covers both binary formats, what differs, and
 the exact reason a Druid sketch can be transplanted into a ClickHouse state and merged with
@@ -7,11 +7,16 @@ other transplanted sketches, but must never be merged with a natively-built Clic
 ## Provenance of these facts
 
 Measured against **Druid 37.0.0** (`datasketches-java` 4.2.0), the **`datasketches` 5.2.0**
-Python binding, and **ClickHouse 26.8.1.120**. Reproducible with:
+Python binding, and **ClickHouse 26.8.1.120**; re-validated on **26.10.1.288**. Reproducible with:
 
 - `spikes/inspect_sketches.py` — Druid's real sketch bytes and preamble fields
-- `spikes/reverse_uniqhll12.py` — the ClickHouse format, step by step, including a
+- `spikes/reverse_uniqhll12.py` — the `uniqHLL12` format, step by step, including a
   byte-exact round-trip of states ClickHouse produced itself
+- `spikes/reverse_uniqcombined64.py` — the same for `uniqCombined64(K)` at every K, plus
+  accuracy against the raw data
+
+`uniqCombined64` (section 2b) was read from ClickHouse source, which also settles several
+`uniqHLL12` points that were originally inferred.
 
 The DataSketches format is a documented, versioned, cross-language contract. **The ClickHouse
 format is not** — it is an internal aggregate-state layout with no stability guarantee, decoded
@@ -114,8 +119,9 @@ estimates.
 
 ## 2. ClickHouse `uniqHLL12`
 
-Only one HLL function exists in this build (`SELECT name FROM system.functions WHERE name ILIKE
-'%hll%'` → `uniqHLL12`), and its precision is **fixed at 12** — 4096 buckets, not configurable.
+It is the only function whose *name* says HLL (`SELECT name FROM system.functions WHERE name
+ILIKE '%hll%'` → `uniqHLL12`), and its precision is **fixed at 12** — 4096 buckets, not
+configurable. `uniqCombined64` is HLL with configurable precision — see section 2b.
 
 ### Sparse ("small set") form, up to 16 distinct values
 
@@ -160,14 +166,39 @@ the field is unspecified behaviour of an internal layout, not a contract to depe
 
 ### Hashing and rank derivation
 
-Ranks top out at **21** and the histogram has exactly **22** slots. Both are consistent with a
-**32-bit** hash: 12 bits go to the bucket index, leaving a 20-bit tail, so rank = leading zeros
-of that tail + 1 ≤ 21. (Inferred from the observed rank ceiling and histogram width, not read
-from ClickHouse source.) A rank of 21 means an all-zero tail — which is why `uniqHLL12State`
+Ranks top out at **21** and the histogram has exactly **22** slots, because the hash is
+**32-bit**: the low 12 bits are the bucket index, leaving a 20-bit tail, and rank = **trailing**
+zeros of that tail + 1 ≤ 21. This was first inferred from the rank ceiling and histogram width
+(the inference said "leading" zeros, which was wrong); the source has since confirmed it.
+`uniqHLL12` is `HyperLogLogCounter<12, …, UInt32>` in `HyperLogLogCounter.h`, the same class
+`uniqCombined64` uses. A rank of 21 means an all-zero tail — which is why `uniqHLL12State`
 over `numbers(n)` always shows exactly one register at 21: the value `0` hashes to `0`.
 
 The 5-bit field could hold up to 31, but **values above 21 must never be written** — they would
 overflow the 22-slot histogram and corrupt the state.
+
+---
+
+## 2b. ClickHouse `uniqCombined64(K)`
+
+Precision K is configurable from **12 to 20** (default 17). The codec is `uniqcombined64.py`;
+its docstring and CLAUDE.md have the details. In outline:
+
+- **Three tiers**, with a container-type byte up front: SMALL (≤ 16 exact hashes), MEDIUM (a hash
+  set of ≤ 2^(K−5) exact hashes), LARGE (HLL). Only LARGE can be written from a DataSketches
+  sketch — same reason as `uniqHLL12`'s sparse form.
+- **LARGE layout**: type byte 3, then 2^K registers at **6 bits**, LSB-first, then a
+  (66−K)-slot `UInt32` histogram, then a zero count that is `UInt16` below K=16 and `UInt32` from
+  K=16. Same structure as `uniqHLL12`'s dense form, scaled up and widened for a 64-bit hash.
+- **Hash**: 64-bit. Bucket = low K bits, rank = trailing zeros of the remaining 64−K bits + 1,
+  capped at 65−K. Integers go through the C++ `intHash64` (the MurmurHash3 finalizer) — *not*
+  the SQL function `intHash64`, which salts its input. Strings go through CityHash64.
+- **Estimator**: linear counting up to 2.5 × 2^K, raw HLL above. The HLL++ bias table applies
+  only at **K=17**. At K=12 this is the same estimator as `uniqHLL12`.
+
+Each K is a separate aggregate type, so states of different K cannot be merged. Section 4's
+argument applies unchanged: transplanted states share DataSketches' key→bucket map with each
+other and not with native `uniqCombined64State()` output.
 
 ---
 
@@ -275,7 +306,8 @@ Theta → HLL is possible but HLL → Theta is not.
 
 ## 5. Consequences for the migration
 
-- **Fold to lgK=12 with `hll_union` where you have the library.** Not because a manual fold is
+- **Fold only as far as the target requires.** `uniqCombined64` needs no fold for lgK 12–20;
+  the rest of this point concerns `uniqHLL12`. **Fold to lgK=12 with `hll_union` where you have the library.** Not because a manual fold is
   wrong — it isn't, for DataSketches. The slot comes from one 64-bit hash lane and the rank from
   the other, so the rank is independent of the index bits and folding *is* a max over registers
   sharing the low lgK bits (verified identical to `hll_union` at lgK 14 → 12, n=20k and n=200k).
@@ -287,11 +319,12 @@ Theta → HLL is possible but HLL → Theta is not.
   a cost of the transplant path that `migrate_hll.py` avoids.
 - **Convert to `HLL_8` before reading registers**, so the payload is a flat byte array rather
   than `HLL_4`'s nibbles-plus-exceptions.
-- **Clamp ranks to 21.** Statistically irrelevant (P(rank > 21) ≈ 2⁻²¹ per item) but structurally
-  mandatory.
+- **Clamp ranks to the target's ceiling:** 21 for `uniqHLL12`, 65−K for `uniqCombined64(K)`.
+  Statistically irrelevant (P(rank > 21) ≈ 2⁻²¹ per item) but structurally mandatory.
 - **Handle the sparse forms.** Druid's stored rollup sketches are usually LIST/SET, so a
   register extractor that only understands dense sketches will fail on the common case.
-- **Re-validate after any ClickHouse upgrade.** `spikes/reverse_uniqhll12.py` is the gate.
+- **Re-validate after any ClickHouse upgrade.** `spikes/reverse_uniqhll12.py` and
+  `spikes/reverse_uniqcombined64.py` are the gates.
 - **Do not compare update-sketch estimates** when checking fidelity — they are HIP-based and
   order-dependent. Compare registers, or post-union estimates, or use the sketch's own error
   bounds as the tolerance.
